@@ -1,0 +1,7 @@
+/target
+/tmp
+/local.toml
+
+# Rig configs carrying a real shared secret and a real host. The tracked
+# agent-*.toml files hold placeholders; the build prefers these when present.
+test/device/*.local.toml

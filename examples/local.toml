@@ -1,0 +1,80 @@
+# Pointing the agent at a NervesHub running on this machine.
+#
+#   cargo run -- --config examples/local.toml
+#
+# Nothing here can touch anything outside ./tmp. The update tool is the sandbox
+# (see src/update_tool/sandbox.rs): it downloads firmware, verifies it, writes
+# it to a file, and stops. No fwup, no block devices, and "reboot" is a log
+# line. That is what makes it safe to run natively rather than in a container.
+#
+# Before this works you need, in the NervesHub UI:
+#   1. an org and a product
+#   2. Product -> Settings -> Shared Secrets -> create one, for product_key and
+#      product_secret below
+#   3. a firmware uploaded, and a deployment group to send it
+
+[server]
+# Your machine's LAN IP — the same value you start NervesHub with:
+#
+#   WEB_HOST=192.168.1.10 mix phx.server
+#
+# WEB_HOST is what dev builds firmware download URLs from, so setting it means
+# the URL the agent is handed is reachable from wherever the agent runs — a
+# container, another machine, an actual device. localhost only works when the
+# agent is a process on this machine, and stops working the moment it is not.
+host = "192.168.1.10"
+# The web endpoint. Shared secrets are accepted here, and the firmware URLs the
+# server hands out point at this same host and port, so there is one address to
+# get right instead of two.
+#
+# The separate device endpoint on web_port + 1 is the mutual-TLS one. It also
+# accepts shared secrets, but it serves a self-signed certificate in dev, which
+# means turning certificate verification off to talk to it — more moving parts
+# for no gain while the credential is an HMAC.
+port = 4000
+# Plain HTTP: dev's web endpoint has no TLS. That means the shared secret goes
+# over the wire in clear, and anything on the path can replay it. Fine pointing
+# at your own machine; not fine anywhere else.
+tls = false
+# Where DeviceSocket is mounted. On the web endpoint this is the only mount —
+# /socket there is the *user* socket, and pointing a device at it fails in a
+# confusing way rather than an obvious one.
+path = "/device-socket"
+heartbeat_interval_secs = 30
+reconnect_backoff_secs = [1, 2, 5, 10]
+
+[identity]
+product_key = "nhp_REPLACE_ME"
+product_secret = "REPLACE_ME"
+# Any string. NervesHub registers an identifier it has not seen before, so
+# changing this gives you a second device to test deployment targeting with.
+identifier = { literal = "agent-dev-01" }
+
+[update_tool]
+name = "sandbox"
+work_dir = "tmp/sandbox"
+# What to report on the first join, before anything has been installed. The
+# uuid has to match a firmware NervesHub knows about for a deployment to
+# consider this device already-on-something; any uuid works to just connect.
+initial_firmware = { uuid = "00000000-0000-0000-0000-000000000000", version = "0.1.0", product = "test-product", platform = "sandbox", architecture = "x86_64" }
+# Stretch the install out so there is a window to watch progress and to answer
+# a reboot question in.
+install_duration_secs = 10
+
+[ipc]
+socket = "tmp/agent.sock"
+mode = 0o600
+
+[updates]
+# Put the controller in the path, so examples/controller.py gets asked.
+# Change to "apply" to watch it update unattended.
+policy = "ask"
+ask_timeout_secs = 30
+# With no controller running, do nothing rather than update — while iterating,
+# a silent update is a test you did not mean to run.
+on_no_controller = "ignore"
+on_timeout = "ignore"
+
+[reboot]
+policy = "ask"
+ask_timeout_secs = 30

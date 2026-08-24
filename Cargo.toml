@@ -1,0 +1,104 @@
+[package]
+name = "nerves-hub-link-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "NervesHub device agent for Linux, with pluggable firmware update tools"
+license = "Apache-2.0"
+
+[lib]
+name = "nerves_hub_link_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nerves-hub-link-agent"
+path = "src/main.rs"
+
+# The only thing on a minimal image that can reach the agent's socket. Without
+# it `mark-valid` is unreachable from a support script, which is where it most
+# needs to be reachable from.
+[[bin]]
+name = "agent-ctl"
+path = "src/bin/agent-ctl.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+# Shared-secret authentication. Pure Rust so the token construction can be
+# tested on the host against vectors a running NervesHub accepted.
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+
+# A websocket, a unix socket, a child process and a pile of timeouts. Threads
+# would work, but every deadline in `ipc::policy` becomes a manual affair and
+# this is not a device where a megabyte of runtime is the constraint.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "process",
+    "io-util",
+    "signal",
+    "sync",
+    "fs",
+] }
+# TLS is rustls rather than the system OpenSSL, and that is a packaging
+# decision more than a cryptographic one. With native-tls the binary links
+# libssl.so.3 and libcrypto.so.3, which means the target image must carry a
+# matching OpenSSL and a cross-build must find its headers -- the single most
+# annoying part of putting a Rust binary into a Buildroot or Yocto image. With
+# rustls the agent depends on nothing but libc.
+#
+# Roots come from the platform store via rustls-native-certs, so a device that
+# already trusts a private CA needs no extra configuration here.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-native-roots",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "stream",
+    "json",
+] }
+portable-pty = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros", "process"] }
+
+[features]
+# The sandbox tool is in the default set deliberately: a build that has not
+# been told which real updater to use should not be able to write to a disk.
+default = ["sandbox", "fwup", "local-shell"]
+
+sandbox = []
+fwup = []
+rauc = []
+
+# Extensions are opt-in at build time as well as at runtime. `local_shell` is
+# the one that matters: it is the only extension that lets someone reach into
+# the device rather than read from it, and a build that cannot serve a shell
+# cannot be talked into serving one by a config file.
+local-shell = ["dep:portable-pty"]

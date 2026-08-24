@@ -1,0 +1,8 @@
+target/
+tmp/*
+# The build needs the ssh public key for the test rig, and nothing else from
+# tmp/ — which otherwise carries a few hundred MB of disk images into the
+# build context on every build.
+!tmp/keys
+tmp/keys/*.priv
+tmp/keys/*key.pem

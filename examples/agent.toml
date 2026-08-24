@@ -1,0 +1,279 @@
+# /etc/nerves-hub-link-agent.toml
+#
+# Everything the agent knows about itself. Values shown are the defaults unless
+# marked otherwise.
+
+[server]
+host = "devices.nervescloud.com"
+port = 443
+tls = true
+# ca_certificate = "/etc/ssl/certs/nervescloud.pem"   # default: system trust store
+heartbeat_interval_secs = 30
+reconnect_backoff_secs = [1, 2, 5, 10, 30, 60]
+
+
+# ---------------------------------------------------------------------------
+# Identity — one of the two blocks below, not both.
+# ---------------------------------------------------------------------------
+
+# HMAC shared secret. A secret says nothing about which device presents it, so
+# the identifier is configured alongside it. NervesHub registers an unknown
+# identifier on first connection, which is what makes this workable for a
+# factory image — but it also means a wrong identifier silently creates a
+# device rather than failing.
+[identity]
+product_key = "nhp_..."
+product_secret = "..."
+identifier = { file = "/sys/firmware/devicetree/base/serial-number" }
+# identifier = { command = "/usr/bin/read-serial" }
+# identifier = { literal = "bench-01" }        # never in a shipped image
+
+# mTLS, where the identifier comes from the certificate's CN and so cannot
+# drift from what the server sees.
+#
+# Not implemented — the agent refuses a config with this block rather than
+# starting and failing later. NervesHub supports it and this is the better
+# answer for a device that can hold a per-device key, so the shape is written
+# down here rather than left to be invented.
+#
+# [identity]
+# certificate = "/var/lib/nerves-hub/cert.pem"
+# private_key = "/var/lib/nerves-hub/key.pem"
+
+
+# ---------------------------------------------------------------------------
+# Update tool — exactly one.
+# ---------------------------------------------------------------------------
+
+[update_tool]
+name = "fwup"
+device = "/dev/mmcblk0"
+task = "upgrade"
+binary = "/usr/bin/fwup"
+# The archive NervesHub stores was verified at upload. That says nothing about
+# the bytes that reached this device, so set this.
+public_key = "..."
+extra_args = []
+# Run on `mark_valid` to tell the bootloader this boot was good. Required for
+# fwup: the agent refuses to start without it rather than discover at
+# `mark_valid` that it has nothing to run, report success, and leave the slot
+# counting down to a revert.
+#
+# Prefer a task in your fwup.conf over poking the environment directly, the way
+# Nerves does. The file that wrote `fw_validated=0` when it applied the update
+# is the file that should clear it -- a `fw_setenv` here names the variable a
+# second time, in a second place, and the two drift.
+#
+# The task needs an archive to run from and the device holds no copy of its own
+# firmware, so ship a small resource-less one built from the same config. See
+# test/device/ops.conf for the whole of it.
+confirm_command = "/usr/bin/fwup --apply --task validate --no-unmount -d /dev/mmcblk0 -i /usr/share/fwup/ops.fw --quiet"
+
+# Where the running firmware's metadata comes from. Both forms are parsed as
+# `key=value` lines, so one parser covers a u-boot device and an image with no
+# u-boot at all.
+#
+# A file in the rootfs, written by the build from the same values that fed the
+# `meta-*` fields in the fwup.conf. True by construction — the rootfs *is* the
+# firmware — but it can say nothing about the other slot or whether this boot is
+# still on probation.
+metadata = { file = "/etc/nerves-hub/firmware.env" }
+# The Nerves convention, and the right answer on a device with a u-boot
+# environment, which is also where boot state lives:
+# metadata = { command = "fw_printenv" }
+
+# [update_tool]
+# name = "rauc"
+# binary = "/usr/bin/rauc"
+# # Hand rauc the URL instead of a file. This is the point of RAUC: it streams
+# # the bundle and skips blocks the target slot already has, so a small change
+# # costs a small download. Needs the URL to honour Range and to outlive the
+# # install.
+# stream_from_url = true
+# # Staging to disk is not implemented -- setting stream_from_url = false makes
+# # the agent refuse the install rather than fall back to a download. The option
+# # is here because RAUC itself supports it and a device on a link too flaky to
+# # hold one long connection would want it.
+# # download_dir = "/var/cache/nerves-hub"
+
+
+# ---------------------------------------------------------------------------
+# The socket applications connect to. See docs/ipc.md.
+# ---------------------------------------------------------------------------
+
+[ipc]
+socket = "/run/nerves-hub-link-agent.sock"
+mode = 0o660
+# With `mode`, this is the entire access control story. Anyone who can open the
+# socket can approve an update, defer a reboot, and read the device's identity.
+# group = "nerveshub"
+
+# Refuse to start until a controller connects. For a device where updating
+# without asking is never acceptable — at the cost of a fleet that stops
+# updating if the application regresses.
+require_controller = false
+
+
+# ---------------------------------------------------------------------------
+# Policy. The defaults update without asking anyone, which is what
+# nerves_hub_link does out of the box.
+# ---------------------------------------------------------------------------
+
+[updates]
+# "apply" installs whatever arrives. "ask" puts the controller in the path.
+policy = "apply"
+ask_timeout_secs = 30
+# What a silent controller means. Both must be defined: an agent that waits
+# forever for an application that crashed is a device that has quietly left the
+# fleet while still looking healthy from the server.
+on_timeout = "apply"
+on_no_controller = "apply"
+
+[reboot]
+# Separate from [updates] on purpose. An application happy to download at any
+# time may still be mid-cycle on something it cannot be interrupted during, and
+# conflating the two forces it to refuse the download to protect the reboot.
+policy = "immediate"     # "immediate" | "ask" | "never"
+# ask_timeout_secs = 30
+# Give up deferring and reboot anyway. Without it, an application that defers
+# forever leaves the device on old firmware while NervesHub shows the update as
+# installed — worse than an inconvenient reboot, because nobody is looking.
+# max_defer_secs = 86400
+#
+# How the device reboots. Defaults to `sudo reboot`: the agent downloads from
+# the network and runs support scripts, so it has no business running as root,
+# which means it needs a sudoers rule for exactly this one command —
+#
+#   agent ALL=(root) NOPASSWD: /sbin/reboot
+#
+# Set to "reboot" where the agent already runs as root, or "systemctl reboot"
+# for an init system that wants to sequence its own shutdown.
+command = "sudo reboot"
+
+[health]
+# Off by default: an extension sends data an operator may not expect a device to
+# send, so it is asked for rather than assumed.
+enabled = false
+interval_secs = 900
+
+
+# ---------------------------------------------------------------------------
+# Extensions.
+#
+# Everything the platform can ask a device for that is not firmware. All off by
+# default: an extension sends data — or opens a way in — that an operator may
+# not expect a device to have.
+#
+# Both halves have to agree. The device offers what is enabled here, and
+# NervesHub replies with the subset it wants attached, which can be narrowed per
+# product and per device. Nothing is reported on a schedule the device chose:
+# health and geo answer when asked, and only logging sends unprompted.
+# ---------------------------------------------------------------------------
+
+[extensions.health]
+# Memory, CPU, load average and temperature, read from /proc and /sys. Answered
+# when NervesHub asks, which is hourly by default.
+#
+# Linux only in the literal sense — there is no /proc on a Mac, so a native
+# macOS run reports an empty metric set rather than inventing numbers. Run the
+# container to see real ones.
+enabled = false
+
+[extensions.geo]
+enabled = false
+# Ask the Nerves project's whenwhere service, which reads the address the
+# request came from. Same service and the same `source: "geoip"` that
+# nerves_hub_link uses, so a mixed fleet lands on one map with one set of
+# caveats. Run as a courtesy — nothing here polls it.
+source = { whenwhere = {} }
+# A position someone measured. Wrong the moment the device moves, which for
+# most installed hardware is never, and far better than GeoIP:
+# source = { fixed = { latitude = -41.28, longitude = 174.77, accuracy = 10.0 } }
+# A GPS, or anything else that prints {"latitude": .., "longitude": ..}:
+# source = { command = "/usr/bin/read-gps" }
+
+[extensions.logging]
+enabled = false
+# journald is the default. `unit` narrows it to one service.
+source = { journald = {} }
+# source = { journald = { unit = "my-app.service" } }
+# Anything that writes lines to stdout, for a system without systemd:
+# source = { command = "tail -F /var/log/messages" }
+#
+# NervesHub rate limits log lines per device and silently drops the excess, so
+# the agent holds itself to the same rate and reports what it dropped in a line
+# of its own. A gap you can see beats one you cannot.
+max_lines_per_second = 5
+
+[extensions.local_shell]
+# Think before turning this on. Every other extension lets the platform read
+# something; this one lets a NervesHub user run commands as whatever the agent
+# runs as, and the device does not get to ask who is on the other end — the
+# authorization happened entirely in NervesHub.
+#
+# It is also gated at build time by the `local-shell` cargo feature, so a binary
+# built without it cannot be talked into serving a shell by a config file.
+enabled = false
+command = "/bin/sh"
+chunk_bytes = 4096
+
+[extensions.network_identity]
+# Identities the device holds on networks NervesHub does not run. Asked for
+# once on attach and never polled — an identity is long-lived by construction.
+enabled = false
+
+# One entry per identity. Each is either a literal value or a command; a command
+# that emits JSON can be pointed at a field, which saves needing jq on the
+# device. A source that fails is logged and skipped, so a device running one of
+# these and not the others still reports what it has.
+#
+# The agent is told where to look rather than detecting anything: four services,
+# four CLIs, four output formats, and an agent that tried to track all of them
+# would be confidently wrong about one within a release.
+
+# [[extensions.network_identity.identities]]
+# service = "tailscale"
+# command = "tailscale status --json"
+# json_pointer = "/Self/PublicKey"
+
+# [[extensions.network_identity.identities]]
+# service = "wireguard"
+# command = "wg show wg0 public-key"
+# instance = "wg0"
+
+# [[extensions.network_identity.identities]]
+# service = "netbird"
+# command = "netbird status --json"
+# json_pointer = "/publicKey"
+
+
+# ---------------------------------------------------------------------------
+# Support scripts.
+#
+# On a Nerves device a support script is Elixir, evaluated in the running VM.
+# There is no VM here, so a script is a shell script — which is what a support
+# script on a Linux device wants to be anyway: journalctl, systemctl status,
+# ip addr, df.
+#
+# A script starting with #! is made executable and run directly, so a Python or
+# sh script works without changing `interpreter`.
+#
+# This is arbitrary shell as whatever the agent runs as, chosen by whoever
+# NervesHub decided may run scripts here. Same power as the local shell,
+# differing only in that someone wrote the commands down first.
+# ---------------------------------------------------------------------------
+
+[scripts]
+# On by default, unlike the extensions: support scripts are how anyone diagnoses
+# a device they cannot reach, and NervesHub already decides who may run one.
+# Turned off, the agent still answers — saying scripts are disabled, rather than
+# going quiet and leaving an operator watching a spinner.
+enabled = true
+work_dir = "/var/lib/nerves-hub-link-agent/scripts"
+interpreter = "bash"
+# Must stay under NervesHub's own 15 second limit, after which it stops
+# listening. A script that overruns produces output nobody receives, and a
+# process still running with nothing watching it. The whole process group is
+# killed, not just the shell, so anything the script backgrounded goes too.
+timeout_secs = 10
+max_output_bytes = 65536

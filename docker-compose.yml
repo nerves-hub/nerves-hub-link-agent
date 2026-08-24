@@ -1,0 +1,26 @@
+# The agent against a NervesHub running on the host.
+#
+#   docker compose up --build
+#
+# No devices are mapped in and no host paths are mounted except the config,
+# read-only. Whatever the agent does to itself stays in the container.
+
+services:
+  agent:
+    build: .
+    volumes:
+      - ./examples/docker.toml:/etc/nerves-hub-link-agent.toml:ro
+      # The IPC socket, so a controller on the host can connect to it.
+      - agent-run:/run/nerves-hub-link-agent
+      - agent-state:/var/lib/nerves-hub-link-agent
+    environment:
+      RUST_LOG: "nerves_hub_link_agent=debug,info"
+    # NervesHub is on the host, not in this compose file — it is your dev
+    # server, with your database and your test data. The config points at the
+    # host's LAN IP rather than a container alias, because that is the address
+    # WEB_HOST puts into firmware URLs, and one address is easier to reason
+    # about than two.
+
+volumes:
+  agent-run:
+  agent-state:

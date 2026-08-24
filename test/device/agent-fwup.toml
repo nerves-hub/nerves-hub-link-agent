@@ -1,0 +1,93 @@
+# The agent's configuration, which ships *in* the firmware.
+#
+# Config is firmware: it should version with the image and be replaced by an
+# update. Identity is not — see `identifier` below.
+#
+# The shared secret and host are placeholders. Copy this file to
+# `agent-fwup.local.toml`, fill in the real values, and the image build
+# prefers it -- that file is gitignored, so a live product secret and the IP of
+# whoever built the image never reach the repository.
+
+[server]
+host = "192.168.1.10"
+port = 4000
+tls = false
+path = "/device-socket"
+
+[identity]
+# A product shared secret is shared by every device in the product by design,
+# so it belongs in the image. A per-device certificate would not, and would
+# live on /data with the identifier.
+product_key = "nhp_REPLACE_ME"
+product_secret = "REPLACE_ME"
+# On /data, which an upgrade never touches. Baked into the rootfs it would make
+# every device built from this image the same device.
+identifier = { file = "/data/nerves-hub/identifier" }
+
+[update_tool]
+name = "fwup"
+device = "/dev/vda"
+task = "upgrade"
+binary = "/usr/local/bin/fwup"
+# The archive NervesHub stored was verified at upload, which says nothing about
+# the bytes that reached this device, so a real device sets this to the public
+# half of the key its firmware is signed with. Left out here because the value
+# is per-fleet: put it in agent-fwup.local.toml alongside the shared secret.
+# public_key = "..."
+# The rig writes to a whole disk, which the agent refuses by default. See
+# `guard_target`: pointing fwup at a block device is how a misconfigured agent
+# destroys a running system, so it has to be asked for.
+allow_block_device = true
+# A fwup task rather than an `fw_setenv` here. The config that wrote
+# `fw_validated=0` when it applied the update is the one that clears it, so the
+# variable is named in one place. Built into the rootfs by package.sh.
+confirm_command = "/usr/local/bin/fwup --apply --task validate --no-unmount -d /dev/vda -i /usr/share/fwup/ops.fw --quiet"
+# The u-boot environment, not a file in the rootfs. A file is true by
+# construction but cannot say whether this boot is still on probation, and
+# probation is the thing this rig exists to exercise.
+metadata = { command = "fw_printenv" }
+
+[ipc]
+socket = "/run/nerves-hub-link-agent/agent.sock"
+mode = 0o660
+
+[updates]
+policy = "apply"
+on_no_controller = "apply"
+
+[reboot]
+# The whole point of this rig: it can actually reboot, and u-boot reads
+# `fw_active` to decide which slot it comes back on.
+policy = "immediate"
+command = "sudo reboot"
+
+[scripts]
+enabled = true
+work_dir = "/data/scripts"
+
+[extensions.health]
+enabled = true
+
+[extensions.logging]
+enabled = true
+source = { journald = {} }
+
+[extensions.local_shell]
+# On here, off everywhere else. This is a throwaway VM on a loopback port, and
+# the extension is the one thing in the agent that cannot be exercised any other
+# way -- it needs a real pty, a real terminal attached from NervesHub, and a
+# systemd session to run under.
+#
+# Do not copy this block into a real device's config without deciding you want
+# it: whoever can open the shell tab in NervesHub runs commands as whatever the
+# agent runs as, and the device does not get to ask who they are.
+enabled = true
+command = "/bin/bash"
+
+[extensions.geo]
+# On for the rigs, like local_shell. GeoIP resolves the public address the
+# request came from, which for a VM behind QEMU's NAT is whatever connection
+# the host is on -- so this pins the machine running the rig, not a device.
+# Fine for a test fleet, and worth knowing before turning it on anywhere else.
+enabled = true
+source = { whenwhere = {} }
