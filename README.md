@@ -105,8 +105,10 @@ which is the main reason TLS is rustls rather than the system OpenSSL.
 
 A Buildroot br2-external tree is in [`support/buildroot/`](support/buildroot/)
 and a Yocto layer in [`support/yocto/`](support/yocto/), each with a script that
-builds it in a container. The Buildroot one produces a working image; the Yocto
-one is verified as far as poky's Rust allows, which is not yet far enough.
+builds it in a container. Both produce a working package: Buildroot against
+2025.08, Yocto against scarthgap. The Yocto layer requires
+[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) for the
+toolchain, because no released Yocto ships a Rust new enough.
 
 ## Why it looks like this
 

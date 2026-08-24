@@ -169,10 +169,10 @@ which trades a build-system version for missed security fixes.
 | Buildroot 2025.02 | 1.82 | no |
 | Buildroot 2025.05 | 1.86 | yes, untested here |
 | **Buildroot 2025.08** | **1.88** | **yes, and built** |
-| Yocto scarthgap | 1.75 | no |
-| Yocto walnascar | 1.84 | no, by one version |
+| Yocto, any release | from meta-rust-bin | yes, and built on scarthgap |
 
-It was 1.88 until reqwest was replaced. reqwest carried an optional QUIC stack
+No released Yocto ships 1.85, which is why the layer requires meta-rust-bin —
+see [Yocto](#yocto). It was 1.88 until reqwest was replaced. reqwest carried an optional QUIC stack
 whose `chacha20` is edition 2024, plus `url` reaching idna and icu, which want
 1.86 and 1.88 -- none of it compiled, all of it in the lockfile, because a
 lockfile records the maximal resolution rather than the enabled one. Removing it
@@ -227,24 +227,54 @@ The layer is [`support/yocto/meta-nerveshub/`](../support/yocto/meta-nerveshub/)
 ./support/yocto/build-test.sh build    # also compile
 ```
 
-**Verified through `fetch`, not through `build`.** The layer loads, the recipe
-parses against 935 others with no errors, and the git source plus every crate
-fetches with the checksums generated from `Cargo.lock`. `build` then reaches
-`do_compile` and stops on poky's cargo. Nothing in the recipe is wrong; no
-released Yocto is new enough.
+Verified on **scarthgap**, the current LTS. The package it produces:
 
-Dropping reqwest was meant to fix this and did not. It moved the floor from
-1.88 to 1.85 and walnascar ships 1.84 -- one version short, and the remaining
-gap is the Rust ecosystem's move to edition 2024 rather than anything the agent
-chose. So the options are now a poky release with 1.85 or newer, or
-[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) to supply a
-toolchain independent of the release.
+```
+/usr/bin/nerves-hub-link-agent                            aarch64
+/usr/bin/agent-ctl
+/etc/nerves-hub-link-agent.toml
+/usr/lib/systemd/system/nerves-hub-link-agent.service
+/usr/lib/systemd/system-preset/98-nerves-hub-link-agent.preset
+```
 
-The layer declares `LAYERDEPENDS_nerveshub = "core rauc"`, so meta-rauc has to
-be in the stack -- the agent shells out to `rauc install`, and declaring it
-fails at layer-add time rather than at build time with "Nothing RPROVIDES".
+with `agent` added as a system user and the binary needing `libgcc_s`, `libm`
+and `libc` and nothing else.
+
+### It requires meta-rust-bin
+
+The agent needs Rust 1.85 and scarthgap ships cargo 1.75, so the toolchain has
+to come from somewhere other than the release.
+[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) supplies
+prebuilt upstream toolchains — it currently packages up to 1.98 and its
+`LAYERSERIES_COMPAT` spans kirkstone through wrynose, so one layer covers every
+release worth targeting.
+
+The recipe therefore inherits `cargo_bin` rather than poky's `cargo`, and
+`LAYERDEPENDS_nerveshub` names `rust-bin-layer` alongside `rauc` so a missing
+layer fails at layer-add time rather than as a cargo that cannot parse edition
+2024.
+
+The tradeoff is theirs to state: these are upstream binaries rather than a
+toolchain built from source in your build system. For a product with
+reproducibility or supply-chain audit requirements that is a real
+consideration, and it is why `meta-rust` still exists alongside it.
+
+### Two things that fail quietly
+
+**`systemd` has to be in `DISTRO_FEATURES`.** Poky defaults to sysvinit, where
+`systemd_system_unitdir` expands to nothing and the unit installs *nowhere* —
+the package builds, ships a binary with nothing to start it, and says nothing.
+The recipe guards the install on the feature, and the test build sets
+`INIT_MANAGER = "systemd"` so the path is actually exercised.
+
+**`UNPACKDIR` is undefined before styhead.** Newer releases unpack `file://`
+entries there; on scarthgap the reference resolves to nothing and you get
+`install: cannot stat '/agent.toml'`. The recipe sets a weak default so one
+path works on both.
+
 `rauc` also has to be in `DISTRO_FEATURES`, which is meta-rauc's requirement
-rather than this layer's.
+rather than this layer's, and meta-rauc supplies the `rauc` the agent shells
+out to.
 
 `bitbake -c update_crates nerves-hub-link-agent` regenerates the crate list
 after a `Cargo.lock` change.

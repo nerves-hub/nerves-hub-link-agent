@@ -75,6 +75,9 @@ SSTATE_DIR = \"/out/sstate\"
 # meta-rauc warns without this, and an image built without it has no RAUC
 # support to speak of. See meta-rauc README.rst.
 DISTRO_FEATURES:append = \" rauc\"
+# systemd, because the recipe ships a unit and poky defaults to sysvinit --
+# where systemd_system_unitdir is empty and the unit installs nowhere at all.
+INIT_MANAGER = \"systemd\"
 CONF
 
             # meta-rauc provides the rauc recipe the agent depends on. It is
@@ -83,8 +86,15 @@ CONF
             [ -d /out/meta-rauc ] || git clone -b \${POKY_BRANCH} --depth 1 \
                 https://github.com/rauc/meta-rauc /out/meta-rauc
 
-            # meta-rauc first: meta-nerveshub declares a dependency on it.
+            # meta-rust-bin supplies the toolchain. Its master branch is
+            # release-agnostic -- LAYERSERIES_COMPAT covers kirkstone through
+            # wrynose -- so it is not pinned to POKY_BRANCH like the others.
+            [ -d /out/meta-rust-bin ] || git clone --depth 1 \
+                https://github.com/rust-embedded/meta-rust-bin /out/meta-rust-bin
+
+            # Dependencies first: meta-nerveshub declares both.
             bitbake-layers add-layer /out/meta-rauc
+            bitbake-layers add-layer /out/meta-rust-bin
             bitbake-layers add-layer /layers/meta-nerveshub
 
             # qemuarm64 matches the architecture the rigs run.

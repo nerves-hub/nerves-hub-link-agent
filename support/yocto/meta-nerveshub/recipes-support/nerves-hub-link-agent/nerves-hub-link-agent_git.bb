@@ -20,7 +20,17 @@ PV = "0.1.0+git"
 
 S = "${WORKDIR}/git"
 
-inherit cargo cargo-update-recipe-crates systemd useradd
+# Where `file://` entries in SRC_URI land. Newer releases unpack them into
+# UNPACKDIR; on scarthgap it is undefined, and referring to it there silently
+# resolves to nothing -- `install: cannot stat '/agent.toml'`. A weak default
+# keeps one path working on both.
+UNPACKDIR ??= "${WORKDIR}"
+
+# `cargo_bin`, from meta-rust-bin, rather than poky's `cargo`. The toolchain
+# comes from that layer because no released Yocto ships a Rust new enough --
+# see the layer README. The class was called `cargo` in older meta-rust-bin and
+# collided with poky's; `cargo_bin` is the current name.
+inherit cargo_bin cargo-update-recipe-crates systemd useradd
 
 # Yocto fetches offline, so cargo cannot resolve dependencies during
 # do_compile. Regenerate with `bitbake -c update_crates nerves-hub-link-agent`
@@ -53,9 +63,14 @@ do_install:append() {
     install -d ${D}${sysconfdir}
     install -m 0644 ${UNPACKDIR}/agent.toml ${D}${sysconfdir}/nerves-hub-link-agent.toml
 
-    install -d ${D}${systemd_system_unitdir}
-    install -m 0644 ${UNPACKDIR}/nerves-hub-link-agent.service \
-        ${D}${systemd_system_unitdir}/nerves-hub-link-agent.service
+    # Guarded, because `systemd_system_unitdir` is empty on a distro without
+    # systemd and the install then quietly puts the unit nowhere: the package
+    # builds, ships a binary with nothing to start it, and says nothing.
+    if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
+        install -d ${D}${systemd_system_unitdir}
+        install -m 0644 ${UNPACKDIR}/nerves-hub-link-agent.service \
+            ${D}${systemd_system_unitdir}/nerves-hub-link-agent.service
+    fi
 }
 
 FILES:${PN} += "${systemd_system_unitdir}/nerves-hub-link-agent.service"

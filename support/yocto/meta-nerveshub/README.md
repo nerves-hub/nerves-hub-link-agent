@@ -20,29 +20,48 @@ and slot work; this layer is only the agent. See `docs/rauc.md` in the source
 tree for what `system.conf` has to say, and `docs/deploying.md` for the service
 user, the identifier and the rest of the deployment contract.
 
-## The Rust version
-
-**The agent needs Rust 1.85, and no released Yocto ships one that new.**
-scarthgap has cargo 1.75 and walnascar 1.84 -- one version short. The recipe is otherwise correct on
-scarthgap -- it parses, resolves layers, fetches the source and all 220 crates,
-and reaches `do_compile`, where cargo stops with:
+## Layers this one needs
 
 ```
-feature `edition2024` is required
-… not stabilized in this version of Cargo (1.75.0)
+bitbake-layers add-layer /path/to/meta-rauc
+bitbake-layers add-layer /path/to/meta-rust-bin
+bitbake-layers add-layer /path/to/support/yocto/meta-nerveshub
 ```
 
-1.85 is where edition 2024 was stabilised, and crates the agent compiles have
-moved to it. Dropping reqwest already took the floor from 1.88 to 1.85; going
-lower would mean pinning a widening set of transitive crates below their
-releases.
+Both are declared in `LAYERDEPENDS`, so a missing one fails when the layer is
+added rather than deep into a build.
 
-Two ways out:
+**meta-rauc** supplies the `rauc` the agent shells out to.
 
-1. **A poky release with Rust >= 1.85**, once there is one.
-2. **[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin)**, which
-   supplies a prebuilt toolchain independent of the release. This is the usual
-   answer for a recipe needing a newer Rust than its release ships.
+**[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin)** supplies the
+toolchain. The agent needs Rust 1.85 -- that is where edition 2024 was
+stabilised, and crates it compiles have moved to it -- and no released Yocto
+ships one that new: scarthgap has cargo 1.75, walnascar 1.84. meta-rust-bin
+packages prebuilt upstream toolchains up to 1.98 and spans kirkstone through
+wrynose, so the Rust version stops being a function of the Yocto release.
+
+The recipe inherits `cargo_bin` from that layer rather than poky's `cargo`.
+
+Their tradeoff, in their words: prebuilt toolchains "will never be able to
+support architectures or options not supported by the Rust team itself", and
+the prebuilt standard library may be less efficient than a custom-compiled one.
+They are also upstream binaries rather than something your build system
+compiled, which matters if you have reproducibility or audit requirements.
+
+## Also required
+
+`rauc` and `systemd` both have to be in `DISTRO_FEATURES`:
+
+```
+DISTRO_FEATURES:append = " rauc"
+INIT_MANAGER = "systemd"
+```
+
+Without systemd, `systemd_system_unitdir` expands to nothing and the unit
+installs nowhere -- the package builds, ships a binary with nothing to start
+it, and says nothing. The recipe guards the install so that is a missing unit
+rather than a broken one, but the image still needs systemd for the agent to
+run as intended.
 
 ## Updating the crate list
 
