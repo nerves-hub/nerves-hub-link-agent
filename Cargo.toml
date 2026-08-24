@@ -2,12 +2,15 @@
 name = "nerves-hub-link-agent"
 version = "0.1.0"
 edition = "2021"
-# Tested in CI, not guessed. 1.77 was declared here and was never true: the
-# dependency tree needs 1.88 (icu_* through idna, and edition2024 crates in the
-# lock that older cargo cannot even vendor). This also decides which Buildroot
-# and Yocto releases can build the agent -- Buildroot ships 1.88 from 2025.08,
-# so raising this pushes integrators onto a newer release.
-rust-version = "1.88"
+# Tested in CI, not guessed. This decides which Buildroot and Yocto releases
+# can build the agent, so it is worth keeping as low as the ecosystem allows.
+#
+# 1.85 is where edition 2024 was stabilised, and that is the binding
+# constraint: crates the agent genuinely compiles (zeroize through rustls,
+# hashbrown through toml) have moved to it, and a cargo older than 1.85 cannot
+# parse their manifests to vendor them. Nothing here can lower it further
+# without pinning a widening set of transitive crates below their releases.
+rust-version = "1.85"
 description = "NervesHub device agent for Linux, with pluggable firmware update tools"
 license = "Apache-2.0"
 
@@ -81,11 +84,30 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls-native-roots",
-    "stream",
-    "json",
+
+# hyper directly rather than reqwest. The agent makes two kinds of request -- a
+# streaming GET for firmware and a small JSON GET for geo -- and reqwest costs
+# far more than that is worth on a device: it carries an optional QUIC stack
+# whose `chacha20` uses edition 2024, and because a lockfile records the
+# maximal resolution rather than the enabled one, vendoring it needs cargo
+# 1.85+ even though nothing here compiles a byte of it. That single unused
+# dependency is what put the agent out of reach of every released Yocto.
+#
+# The `url` crate is avoided for the same reason: it reaches idna and icu,
+# which want 1.86 and 1.88. Redirects are resolved against `http::Uri` instead.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "client-legacy",
+    "http1",
+    "tokio",
 ] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "ring",
+    "http1",
+    "tls12",
+] }
+http-body-util = "0.1"
+bytes = "1"
 portable-pty = { version = "0.9", optional = true }
 
 [dev-dependencies]

@@ -154,7 +154,7 @@ impl Fwup {
     pub async fn install_async(
         &mut self,
         update: &UpdatePayload,
-        client: &reqwest::Client,
+        client: &crate::http::Client,
         mut progress: impl FnMut(Stage, u8),
     ) -> Result<Installed, Error> {
         let url = update
@@ -167,13 +167,9 @@ impl Fwup {
             .clone()
             .ok_or_else(|| Error::Download("update has no firmware metadata".into()))?;
 
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Download(e.to_string()))?;
+        let response = client.get(url).await?;
 
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(Error::Download(format!(
                 "{url} returned {}",
                 response.status()
@@ -330,19 +326,15 @@ struct Transferred {
 
 /// Stream the response body into fwup, hashing on the way past.
 async fn feed(
-    response: reqwest::Response,
+    mut response: crate::http::Response,
     mut stdin: tokio::process::ChildStdin,
 ) -> Result<Transferred, Error> {
-    use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     let mut bytes = 0u64;
-    let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error::Download(e.to_string()))?;
-
+    while let Some(chunk) = response.chunk().await? {
         hasher.update(&chunk);
         bytes += chunk.len() as u64;
 

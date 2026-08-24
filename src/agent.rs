@@ -125,7 +125,7 @@ impl Tool {
     async fn install(
         &mut self,
         update: &UpdatePayload,
-        client: &reqwest::Client,
+        client: &crate::http::Client,
         progress: impl FnMut(Stage, u8),
     ) -> Result<crate::update_tool::Installed, Error> {
         match self {
@@ -158,7 +158,7 @@ pub struct Agent {
     tool: Tool,
     ipc: Ipc,
     commands: mpsc::Receiver<Command>,
-    http: reqwest::Client,
+    http: crate::http::Client,
     health: Health,
     geo: Geo,
     network_identity: NetworkIdentity,
@@ -216,23 +216,7 @@ impl Agent {
         // Two different answers would be worse than one wrong one: a device
         // that trusts the server but not its firmware host is not more secure,
         // it just fails somewhere less obvious.
-        let mut http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(config.server.danger_accept_invalid_certs);
-
-        // The same CA the socket trusts. Wiring it into only one of the two was
-        // the failure the comment above describes: the device joined, reported
-        // itself healthy, and then failed every firmware download against a
-        // certificate it had been configured to accept.
-        for certificate in crate::transport::extra_root_certificates(&config)? {
-            let certificate = reqwest::Certificate::from_der(&certificate)
-                .map_err(|e| Error::Config(format!("the configured CA: {e}")))?;
-
-            http = http.add_root_certificate(certificate);
-        }
-
-        let http = http
-            .build()
-            .map_err(|e| Error::Config(format!("building http client: {e}")))?;
+        let http = crate::http::Client::new(&config)?;
 
         // The log tail starts once, not per session. A reconnect should not
         // restart journalctl, and a source that dies is a problem worth seeing

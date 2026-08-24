@@ -50,7 +50,7 @@ async fn an_update_streams_into_fwup_and_lands_in_the_free_slot() {
     let installed = fwup
         .install_async(
             &update(&url, &std::fs::read(&v2).unwrap()),
-            &reqwest::Client::new(),
+            &nerves_hub_link_agent::http::Client::with_native_roots().unwrap(),
             move |stage, percent| collected.lock().unwrap().push((stage, percent)),
         )
         .await
@@ -110,7 +110,11 @@ async fn a_checksum_that_does_not_match_is_reported() {
     payload.checksum = Some("0".repeat(64));
 
     let error = fwup
-        .install_async(&payload, &reqwest::Client::new(), |_, _| {})
+        .install_async(
+            &payload,
+            &nerves_hub_link_agent::http::Client::with_native_roots().unwrap(),
+            |_, _| {},
+        )
         .await
         .expect_err("a wrong checksum should not be reported as success");
 
@@ -141,7 +145,11 @@ async fn a_truncated_archive_fails_without_disturbing_the_running_slot() {
     let mut fwup = tool(&disk);
 
     let error = fwup
-        .install_async(&update(&url, half), &reqwest::Client::new(), |_, _| {})
+        .install_async(
+            &update(&url, half),
+            &nerves_hub_link_agent::http::Client::with_native_roots().unwrap(),
+            |_, _| {},
+        )
         .await
         .expect_err("a truncated archive should fail");
 

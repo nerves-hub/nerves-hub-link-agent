@@ -154,31 +154,34 @@ the real level. Nothing to configure.
 
 ## Rust version
 
-The agent needs **Rust 1.88**, and that constrains which Buildroot and Yocto
+The agent needs **Rust 1.85**, and that constrains which Buildroot and Yocto
 releases can build it more than anything else on this page.
 
-The reason is not the agent's own code. `Cargo.lock` is feature-independent, so
-it lists every package any feature combination could pull -- including
-`chacha20` through reqwest's optional QUIC support, which nothing here enables.
-Vendoring parses every manifest in the lock, `chacha20` uses edition 2024, and a
-cargo older than 1.85 cannot parse it at all:
+1.85 is where edition 2024 was stabilised, and that is the whole of the
+constraint. Crates the agent genuinely compiles have moved to it -- `zeroize`
+through rustls, `hashbrown` through toml -- and an older cargo cannot parse
+their manifests to vendor them. Nothing here can lower it further without
+pinning a widening set of transitive crates below their current releases,
+which trades a build-system version for missed security fixes.
 
-```
-feature `edition2024` is required
-… not stabilized in this version of Cargo (1.75.0)
-```
-
-| | Rust | builds the agent |
+| | Rust | vs the 1.85 floor |
 | --- | --- | --- |
 | Buildroot 2025.02 | 1.82 | no |
-| Buildroot 2025.05 | 1.86 | no |
-| **Buildroot 2025.08** | **1.88** | **yes** |
+| Buildroot 2025.05 | 1.86 | yes, untested here |
+| **Buildroot 2025.08** | **1.88** | **yes, and built** |
 | Yocto scarthgap | 1.75 | no |
-| Yocto walnascar | 1.84 | no |
+| Yocto walnascar | 1.84 | no, by one version |
 
-CI builds with exactly the declared version, so this cannot drift again. It did
-once: `rust-version` said 1.77 for months and the first thing to notice was a
-Buildroot image failing to vendor the lock.
+It was 1.88 until reqwest was replaced. reqwest carried an optional QUIC stack
+whose `chacha20` is edition 2024, plus `url` reaching idna and icu, which want
+1.86 and 1.88 -- none of it compiled, all of it in the lockfile, because a
+lockfile records the maximal resolution rather than the enabled one. Removing it
+took the tree from 221 crates to 158 and the release binary from 9.6 MB to
+7.6 MB.
+
+CI builds with exactly the declared version, read out of `Cargo.toml`, so the
+two cannot disagree. They did once: `rust-version` said 1.77 for months and the
+first thing to notice was a Buildroot image failing to vendor the lock.
 
 ## Buildroot
 
@@ -225,15 +228,17 @@ The layer is [`support/yocto/meta-nerveshub/`](../support/yocto/meta-nerveshub/)
 ```
 
 **Verified through `fetch`, not through `build`.** The layer loads, the recipe
-parses against 935 others with no errors, and the git source plus all 220
-crates fetch with the checksums generated from `Cargo.lock`. `build` then
-reaches `do_compile` and stops on poky's cargo being 1.75 -- see
-[Rust version](#rust-version). Nothing in the recipe is wrong; no released
-Yocto is new enough yet.
+parses against 935 others with no errors, and the git source plus every crate
+fetches with the checksums generated from `Cargo.lock`. `build` then reaches
+`do_compile` and stops on poky's cargo. Nothing in the recipe is wrong; no
+released Yocto is new enough.
 
-Three ways forward, in the order worth trying: a poky release with Rust 1.88,
-[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) to override the
-toolchain, or dropping reqwest from the agent to lower the floor.
+Dropping reqwest was meant to fix this and did not. It moved the floor from
+1.88 to 1.85 and walnascar ships 1.84 -- one version short, and the remaining
+gap is the Rust ecosystem's move to edition 2024 rather than anything the agent
+chose. So the options are now a poky release with 1.85 or newer, or
+[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) to supply a
+toolchain independent of the release.
 
 The layer declares `LAYERDEPENDS_nerveshub = "core rauc"`, so meta-rauc has to
 be in the stack -- the agent shells out to `rauc install`, and declaring it

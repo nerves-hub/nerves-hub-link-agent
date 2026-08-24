@@ -131,10 +131,9 @@ impl Sandbox {
     pub async fn install_async(
         &mut self,
         update: &UpdatePayload,
-        client: &reqwest::Client,
+        client: &crate::http::Client,
         mut progress: impl FnMut(Stage, u8),
     ) -> Result<Installed, Error> {
-        use futures_util::StreamExt;
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncWriteExt;
 
@@ -158,13 +157,9 @@ impl Sandbox {
         let target = self.config.work_dir.join(format!("{}.fw", meta.uuid));
         let mut file = tokio::fs::File::create(&target).await?;
 
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Download(e.to_string()))?;
+        let mut response = client.get(url).await?;
 
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(Error::Download(format!(
                 "{} returned {}",
                 url,
@@ -179,11 +174,7 @@ impl Sandbox {
         let mut written: u64 = 0;
         let mut last_reported = 0u8;
 
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Error::Download(e.to_string()))?;
-
+        while let Some(chunk) = response.chunk().await? {
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
             written += chunk.len() as u64;

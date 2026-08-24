@@ -52,12 +52,14 @@ pub mod agent;
 pub mod config;
 pub mod error;
 pub mod extensions;
+pub mod http;
 pub mod identity;
 pub mod ipc;
 pub mod link;
 pub mod message;
 pub mod scripts;
 pub mod shared_secret;
+pub mod tls;
 pub mod transport;
 pub mod update_tool;
 

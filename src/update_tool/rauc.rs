@@ -198,7 +198,7 @@ impl Rauc {
     pub async fn install_async(
         &mut self,
         update: &UpdatePayload,
-        _client: &reqwest::Client,
+        _client: &crate::http::Client,
         mut progress: impl FnMut(Stage, u8),
     ) -> Result<Installed, Error> {
         let url = update

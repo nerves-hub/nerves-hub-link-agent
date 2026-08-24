@@ -20,7 +20,7 @@ impl Geo {
     }
 
     /// A location, in the shape `geo:location:update` expects.
-    pub async fn locate(&self, client: &reqwest::Client) -> Result<Value, Error> {
+    pub async fn locate(&self, client: &crate::http::Client) -> Result<Value, Error> {
         match &self.source {
             GeoSource::Fixed {
                 latitude,
@@ -56,22 +56,18 @@ impl Geo {
 /// own, and that answer would otherwise be taken as a position. Requiring the
 /// nonce back in a header means an answer that was not produced for this
 /// request is rejected.
-async fn whenwhere(client: &reqwest::Client, base: &str) -> Result<Value, Error> {
+async fn whenwhere(client: &crate::http::Client, base: &str) -> Result<Value, Error> {
     let nonce = nonce();
 
     let response = client
-        .get(format!("{base}/?nonce={nonce}"))
-        .header("accept", "application/json")
-        .send()
+        .get_with(
+            &format!("{base}/?nonce={nonce}"),
+            &[("accept", "application/json")],
+        )
         .await
         .map_err(|e| Error::Connection(format!("whenwhere: {e}")))?;
 
-    let echoed = response
-        .headers()
-        .get("x-nonce")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
+    let echoed = response.header("x-nonce").unwrap_or_default().to_string();
 
     if echoed != nonce {
         return Err(Error::Connection(
@@ -169,7 +165,10 @@ mod tests {
             accuracy: Some(10.0),
         });
 
-        let location = geo.locate(&reqwest::Client::new()).await.unwrap();
+        let location = geo
+            .locate(&crate::http::Client::with_native_roots().unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(location["latitude"], -41.28);
         assert_eq!(location["source"], "configured");
@@ -181,7 +180,10 @@ mod tests {
             "printf '{\"latitude\": 1.0, \"longitude\": 2.0}'".into(),
         ));
 
-        let location = geo.locate(&reqwest::Client::new()).await.unwrap();
+        let location = geo
+            .locate(&crate::http::Client::with_native_roots().unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(location["source"], "gps");
     }
@@ -190,7 +192,10 @@ mod tests {
     async fn a_failing_command_is_an_error_not_a_position() {
         let geo = Geo::new(GeoSource::Command("exit 1".into()));
 
-        assert!(geo.locate(&reqwest::Client::new()).await.is_err());
+        assert!(geo
+            .locate(&crate::http::Client::with_native_roots().unwrap())
+            .await
+            .is_err());
     }
 
     #[test]
