@@ -1,8 +1,15 @@
 target/
 tmp/*
-# The build needs the ssh public key for the test rig, and nothing else from
-# tmp/ — which otherwise carries a few hundred MB of disk images into the
-# build context on every build.
+
+# The build needs exactly two files out of tmp/: the rig's ssh *public* key and
+# the RAUC keyring certificate. Everything else in tmp/ is either a few hundred
+# MB of disk images or a private key.
+#
+# This is an allowlist rather than a list of things to exclude, and that is the
+# point. The previous version excluded `*.priv` and `*key.pem`, which let
+# `tmp/keys/qemu_ed25519` -- an ssh private key, named after no pattern -- into
+# the build context on every build. Naming what may go in cannot fail that way.
 !tmp/keys
-tmp/keys/*.priv
-tmp/keys/*key.pem
+tmp/keys/*
+!tmp/keys/qemu_ed25519.pub
+!tmp/keys/rauc-cert.pem

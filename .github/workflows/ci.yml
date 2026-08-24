@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first one's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      # Warnings fail here rather than accumulating. The four that existed
+      # before this workflow did were all real, and one of them was an import
+      # that only the test build used.
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - run: cargo test --all-features
+
+      # The version comes out of the Dockerfile so the two cannot drift: the
+      # integration tests assert against fwup's behaviour, and testing a
+      # different fwup from the one the device images carry would prove
+      # something about neither.
+      - name: install fwup
+        run: |
+          version="$(sed -n 's/^ARG FWUP_VERSION=//p' Dockerfile | head -1)"
+          echo "installing fwup ${version}"
+          curl -fsSL -o /tmp/fwup.deb \
+            "https://github.com/fwup-home/fwup/releases/download/v${version}/fwup_${version}_amd64.deb"
+          sudo dpkg -i /tmp/fwup.deb
+          fwup --version
+
+      # `--ignored` is the whole point of this step. These tests drive a real
+      # fwup against a real A/B image and are skipped by default because a
+      # laptop has no fwup; skipped in CI as well they would never run at all.
+      - run: cargo test --all-features -- --ignored
+
+  features:
+    name: feature combinations
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # A device builds only the tool it has, so each of these is a shape
+        # someone actually ships. `rauc` is the one that matters most: it is
+        # not in the default set, so nothing else here compiles it.
+        features:
+          - --no-default-features --features sandbox
+          - --no-default-features --features fwup
+          - --no-default-features --features rauc
+          - --no-default-features --features rauc,local-shell
+          - --no-default-features --features fwup,local-shell
+          - --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - run: cargo check --all-targets ${{ matrix.features }}
+
+  images:
+    name: device images
+    # arm64 by construction, not by preference: the u-boot stages run
+    # `make qemu_arm64_defconfig && make` with no CROSS_COMPILE, so they only
+    # build in an arm64 container. These runners are free for public repos and
+    # match what the rigs are developed on.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [fwup, rauc]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The build needs an ssh public key for the rig's authorized_keys. CI
+      # never boots the image, so a throwaway key keeps the Dockerfile honest
+      # without committing one.
+      - name: generate a throwaway rig key
+        run: |
+          mkdir -p tmp/keys
+          ssh-keygen -t ed25519 -N '' -C ci -f tmp/keys/qemu_ed25519
+
+      - name: build the ${{ matrix.scheme }} device image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: BOOT_SCHEME=${{ matrix.scheme }}
+          push: false
+          cache-from: type=gha,scope=device-${{ matrix.scheme }}
+          cache-to: type=gha,mode=max,scope=device-${{ matrix.scheme }}
