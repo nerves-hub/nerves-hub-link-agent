@@ -1,0 +1,43 @@
+# Shipped by the nerves-hub-link-agent Buildroot package as a starting point.
+# Config is firmware: it versions with the image and is replaced by an update,
+# so a real product edits this in its br2-external tree rather than on a device.
+#
+# See examples/agent.toml in the source tree for every option, annotated.
+
+[server]
+host = "devices.nervescloud.com"
+port = 443
+tls = true
+path = "/device-socket"
+
+[identity]
+product_key = "nhp_REPLACE_ME"
+product_secret = "REPLACE_ME"
+# An update overwrites the whole rootfs slot, so the identifier lives somewhere
+# that survives one. Reading it from the hardware is better where the hardware
+# has one: { file = "/sys/firmware/devicetree/base/serial-number" }
+identifier = { file = "/data/nerves-hub/identifier" }
+
+[update_tool]
+name = "fwup"
+device = "/dev/mmcblk0"
+task = "upgrade"
+binary = "/usr/bin/fwup"
+# NervesHub verified the archive at upload, which says nothing about the bytes
+# that reached this device. Set this to the public half of your signing key.
+# public_key = "..."
+# Required for fwup: without it the agent cannot mark a boot valid, and an
+# unvalidated slot is rolled back. See docs/fwup.md.
+confirm_command = "/usr/bin/fwup --apply --task validate --no-unmount -d /dev/mmcblk0 -i /usr/share/fwup/ops.fw --quiet"
+metadata = { command = "fw_printenv" }
+allow_block_device = true
+
+[ipc]
+socket = "/run/nerves-hub-link-agent/agent.sock"
+
+[updates]
+policy = "apply"
+
+[reboot]
+policy = "immediate"
+command = "reboot"

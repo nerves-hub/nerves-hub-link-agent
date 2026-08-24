@@ -823,6 +823,18 @@ mod tests {
         );
     }
 
+    /// The config the Buildroot package installs at /etc. It ships to devices,
+    /// so it has to keep passing the same validation a hand-written one does.
+    #[test]
+    fn the_buildroot_packaged_config_parses() {
+        let source = include_str!("../support/buildroot/package/nerves-hub-link-agent/agent.toml");
+
+        let config = Config::from_toml(source).expect("the packaged config should parse");
+
+        assert_eq!(config.update_tool.tool_name(), "fwup");
+        assert!(config.server.tls, "a shipped default must not be plaintext");
+    }
+
     /// An fwup agent that cannot mark a boot valid used to start anyway, then
     /// answer `mark_valid` with success and report `firmware_validated` while
     /// the flag on disk stayed at `0`.

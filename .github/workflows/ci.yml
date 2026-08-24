@@ -53,6 +53,24 @@ jobs:
       # laptop has no fwup; skipped in CI as well they would never run at all.
       - run: cargo test --all-features -- --ignored
 
+  msrv:
+    name: minimum supported rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Read from Cargo.toml so the two cannot disagree. The declared version
+      # was wrong by eleven minor releases before anything checked it, and the
+      # first thing to notice was a Buildroot image failing to vendor the lock.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = \"\(.*\)\"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-features --locked
+
   features:
     name: features (${{ matrix.id }})
     runs-on: ubuntu-latest

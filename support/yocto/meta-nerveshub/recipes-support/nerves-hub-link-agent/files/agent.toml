@@ -1,0 +1,40 @@
+# Shipped by the nerves-hub-link-agent recipe as a starting point. Config is
+# firmware: it versions with the image and is replaced by an update, so a real
+# product overrides this from its own layer rather than editing it on a device.
+#
+# See examples/agent.toml in the source tree for every option, annotated.
+
+[server]
+host = "devices.nervescloud.com"
+port = 443
+tls = true
+path = "/device-socket"
+
+[identity]
+product_key = "nhp_REPLACE_ME"
+product_secret = "REPLACE_ME"
+# An update overwrites the whole rootfs slot, so the identifier lives somewhere
+# that survives one. Reading it from the hardware is better where the hardware
+# has one: { file = "/sys/firmware/devicetree/base/serial-number" }
+identifier = { file = "/data/nerves-hub/identifier" }
+
+[update_tool]
+name = "rauc"
+binary = "/usr/bin/rauc"
+# The point of RAUC: it streams the bundle and fetches only the blocks the
+# target slot lacks. Handing it a downloaded file gives that up entirely, and
+# the agent refuses rather than silently falling back.
+stream_from_url = true
+# There is no public_key here and no confirm_command: RAUC verifies against its
+# own keyring from system.conf, knows its slots, and marks a boot good through
+# `rauc status mark-good booted`, which the agent runs on mark_valid.
+
+[ipc]
+socket = "/run/nerves-hub-link-agent/agent.sock"
+
+[updates]
+policy = "apply"
+
+[reboot]
+policy = "immediate"
+command = "reboot"

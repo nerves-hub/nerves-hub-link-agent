@@ -1,0 +1,24 @@
+config BR2_PACKAGE_NERVES_HUB_LINK_AGENT
+	bool "nerves-hub-link-agent"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_HOST_RUSTC
+	help
+	  NervesHub device agent for Linux devices that are not running
+	  Nerves. Connects to NervesHub over Phoenix Channels, reports the
+	  running firmware, and applies updates through fwup.
+
+	  The agent asks the application on the device whether an update may
+	  be installed and whether it may reboot, over a Unix socket. See
+	  docs/ipc.md in the source tree.
+
+	  Needs Buildroot 2025.08 or newer: the agent requires Rust 1.88 and
+	  earlier releases ship a cargo that cannot vendor its dependencies.
+
+	  https://github.com/nerves-hub/nerves-hub-link-agent
+
+comment "nerves-hub-link-agent needs a toolchain w/ threads"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	depends on BR2_USE_MMU
+	depends on !BR2_TOOLCHAIN_HAS_THREADS

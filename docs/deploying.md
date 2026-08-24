@@ -11,6 +11,7 @@ slots, validation, rollback — is per update tool and lives in
 - [What the device needs](#what-the-device-needs)
 - [Cross-compiling](#cross-compiling)
 - [The systemd unit](#the-systemd-unit)
+- [Rust version](#rust-version)
 - [Buildroot](#buildroot)
 - [Yocto](#yocto)
 - [TLS](#tls)
@@ -151,135 +152,97 @@ The agent detects systemd through `JOURNAL_STREAM` and logs accordingly: no
 timestamp of its own, and systemd's `<N>` priority prefix so the journal records
 the real level. Nothing to configure.
 
+## Rust version
+
+The agent needs **Rust 1.88**, and that constrains which Buildroot and Yocto
+releases can build it more than anything else on this page.
+
+The reason is not the agent's own code. `Cargo.lock` is feature-independent, so
+it lists every package any feature combination could pull -- including
+`chacha20` through reqwest's optional QUIC support, which nothing here enables.
+Vendoring parses every manifest in the lock, `chacha20` uses edition 2024, and a
+cargo older than 1.85 cannot parse it at all:
+
+```
+feature `edition2024` is required
+… not stabilized in this version of Cargo (1.75.0)
+```
+
+| | Rust | builds the agent |
+| --- | --- | --- |
+| Buildroot 2025.02 | 1.82 | no |
+| Buildroot 2025.05 | 1.86 | no |
+| **Buildroot 2025.08** | **1.88** | **yes** |
+| Yocto scarthgap | 1.75 | no |
+| Yocto walnascar | 1.84 | no |
+
+CI builds with exactly the declared version, so this cannot drift again. It did
+once: `rust-version` said 1.77 for months and the first thing to notice was a
+Buildroot image failing to vendor the lock.
+
 ## Buildroot
 
-Buildroot's `cargo-package` infrastructure handles the build. In
-`package/nerves-hub-link-agent/`:
+A complete br2-external tree is in
+[`support/buildroot/`](../support/buildroot/): the package, its `Config.in`,
+the systemd unit and a starting `agent.toml`.
 
-`Config.in`:
-
-```
-config BR2_PACKAGE_NERVES_HUB_LINK_AGENT
-	bool "nerves-hub-link-agent"
-	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
-	depends on BR2_USE_MMU
-	select BR2_PACKAGE_HOST_RUSTC
-	help
-	  NervesHub device agent: connects to NervesHub, reports the running
-	  firmware, and applies updates through fwup.
-
-	  https://github.com/nerves-hub/nerves-hub-link-agent
+```bash
+./support/buildroot/build-test.sh          # build the package
+./support/buildroot/build-test.sh image    # and the whole rootfs
 ```
 
-`nerves-hub-link-agent.mk`:
+That script builds it in a container against Buildroot 2025.08.1 with
+`qemu_aarch64_virt_defconfig` -- the same board the QEMU rigs emulate -- and it
+is how the tree is verified rather than assumed. The resulting image contains:
 
-```make
-NERVES_HUB_LINK_AGENT_VERSION = 0.1.0
-NERVES_HUB_LINK_AGENT_SITE = \
-	$(call github,nerves-hub,nerves-hub-link-agent,v$(NERVES_HUB_LINK_AGENT_VERSION))
-NERVES_HUB_LINK_AGENT_LICENSE = Apache-2.0
-NERVES_HUB_LINK_AGENT_LICENSE_FILES = LICENSE
-
-# fwup only: a Buildroot image is the fwup case, and building the RAUC
-# installer into it would ship code the device can never reach.
-NERVES_HUB_LINK_AGENT_CARGO_BUILD_OPTS = --no-default-features --features fwup
-
-# The agent does not run as root. See the sudoers rule in docs/deploying.md.
-NERVES_HUB_LINK_AGENT_USERS = agent -1 agent -1 * - - - NervesHub agent
-
-define NERVES_HUB_LINK_AGENT_INSTALL_CONFIG
-	$(INSTALL) -D -m 0644 $(NERVES_HUB_LINK_AGENT_PKGDIR)/agent.toml \
-		$(TARGET_DIR)/etc/nerves-hub-link-agent.toml
-endef
-NERVES_HUB_LINK_AGENT_POST_INSTALL_TARGET_HOOKS += NERVES_HUB_LINK_AGENT_INSTALL_CONFIG
-
-define NERVES_HUB_LINK_AGENT_INSTALL_INIT_SYSTEMD
-	$(INSTALL) -D -m 0644 $(NERVES_HUB_LINK_AGENT_PKGDIR)/nerves-hub-link-agent.service \
-		$(TARGET_DIR)/usr/lib/systemd/system/nerves-hub-link-agent.service
-endef
-
-$(eval $(cargo-package))
+```
+/usr/bin/nerves-hub-link-agent          aarch64, 6.8M stripped
+/etc/nerves-hub-link-agent.toml
+/usr/lib/systemd/system/nerves-hub-link-agent.service
+/etc/systemd/system/multi-user.target.wants/nerves-hub-link-agent.service
+agent:x:104:110:NervesHub agent:/:/bin/false
 ```
 
-Add `source "package/nerves-hub-link-agent/Config.in"` to
-`package/Config.in`, and drop `agent.toml` and the unit file beside the `.mk`.
+and the binary needs `libgcc_s`, `libm` and `libc`, nothing else -- no OpenSSL
+to install or keep in step, which is the whole reason TLS is rustls.
 
-The identifier wants a data partition that `genimage.cfg` keeps outside both
-rootfs slots, and the fwup.conf that writes those slots is
-[the one in this repo](../test/device/fwup.conf).
+To use it in your own tree, point `BR2_EXTERNAL` at `support/buildroot` and
+enable `BR2_PACKAGE_NERVES_HUB_LINK_AGENT`. The package pins a commit; replace
+it with a tag when there is one.
+
+Two things the package does not do, because they belong to a product rather
+than to a package: the identifier on a partition an update does not overwrite,
+and the fwup.conf that defines the A/B layout. See [fwup.md](fwup.md).
 
 ## Yocto
 
-RAUC's own layer, [meta-rauc](https://github.com/rauc/meta-rauc), does the
-bundle and slot work. This recipe is only the agent.
+The layer is [`support/yocto/meta-nerveshub/`](../support/yocto/meta-nerveshub/).
 
-`recipes-support/nerves-hub-link-agent/nerves-hub-link-agent_0.1.0.bb`:
-
-```bitbake
-SUMMARY = "NervesHub device agent"
-DESCRIPTION = "Connects a Linux device to NervesHub and applies updates through RAUC."
-HOMEPAGE = "https://github.com/nerves-hub/nerves-hub-link-agent"
-LICENSE = "Apache-2.0"
-LIC_FILES_CHKSUM = "file://LICENSE;md5=<fill this in>"
-
-SRC_URI = "git://github.com/nerves-hub/nerves-hub-link-agent.git;protocol=https;branch=main \
-           file://nerves-hub-link-agent.service \
-           file://agent.toml"
-SRCREV = "<pin a commit>"
-
-S = "${WORKDIR}/git"
-
-inherit cargo cargo-update-recipe-crates systemd useradd
-
-# Generated by `bitbake -c update_crates nerves-hub-link-agent`. Yocto builds
-# offline, so every crate has to be declared as a source rather than fetched
-# by cargo during do_compile.
-require ${BPN}-crates.inc
-
-# RAUC only, on a Yocto image. The agent talks to `rauc install` over D-Bus, so
-# rauc has to be in the image and its service running.
-CARGO_BUILD_FLAGS += "--no-default-features --features rauc"
-RDEPENDS:${PN} += "rauc"
-
-SYSTEMD_SERVICE:${PN} = "nerves-hub-link-agent.service"
-SYSTEMD_AUTO_ENABLE:${PN} = "enable"
-
-USERADD_PACKAGES = "${PN}"
-GROUPADD_PARAM:${PN} = "--system agent"
-USERADD_PARAM:${PN} = "--system --no-create-home --shell /sbin/nologin --gid agent agent"
-
-do_install:append() {
-    install -d ${D}${sysconfdir}
-    install -m 0644 ${WORKDIR}/agent.toml ${D}${sysconfdir}/nerves-hub-link-agent.toml
-
-    install -d ${D}${systemd_unitdir}/system
-    install -m 0644 ${WORKDIR}/nerves-hub-link-agent.service \
-        ${D}${systemd_unitdir}/system/nerves-hub-link-agent.service
-}
-
-FILES:${PN} += "${systemd_unitdir}/system/nerves-hub-link-agent.service"
+```bash
+./support/yocto/build-test.sh parse    # layers and recipe parse
+./support/yocto/build-test.sh fetch    # also every crate, checksums included
+./support/yocto/build-test.sh build    # also compile
 ```
 
-Three things that catch people out:
+**Verified through `fetch`, not through `build`.** The layer loads, the recipe
+parses against 935 others with no errors, and the git source plus all 220
+crates fetch with the checksums generated from `Cargo.lock`. `build` then
+reaches `do_compile` and stops on poky's cargo being 1.75 -- see
+[Rust version](#rust-version). Nothing in the recipe is wrong; no released
+Yocto is new enough yet.
 
-**`cargo-update-recipe-crates` is not optional.** Yocto fetches offline, so
-cargo cannot resolve dependencies during `do_compile`. Run
-`bitbake -c update_crates nerves-hub-link-agent` to generate `-crates.inc`, and
-regenerate it whenever `Cargo.lock` changes.
+Three ways forward, in the order worth trying: a poky release with Rust 1.88,
+[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) to override the
+toolchain, or dropping reqwest from the agent to lower the floor.
 
-**The agent needs `rauc` at runtime, not just at build time.** `rauc install` is
-a D-Bus client and the work happens in `rauc service`; without it the agent gets
-`Error creating proxy: Could not connect`, which reads like a broken bundle. The
-agent probes for the service at startup so that lands early.
+The layer declares `LAYERDEPENDS_nerveshub = "core rauc"`, so meta-rauc has to
+be in the stack -- the agent shells out to `rauc install`, and declaring it
+fails at layer-add time rather than at build time with "Nothing RPROVIDES".
+`rauc` also has to be in `DISTRO_FEATURES`, which is meta-rauc's requirement
+rather than this layer's.
 
-**`statusfile` has to be outside the rootfs.** RAUC records what it installed,
-an update overwrites the whole slot, and that record has to outlive it. See
-[rauc.md](rauc.md).
-
-**These two are written from the conventions, not from a build.** Neither has
-been run here — the rigs in this repo are Debian under QEMU, which is what made
-the bootloader work verifiable. Treat the recipes as a starting point and expect
-to fix the checksums and the SRCREV at minimum.
+`bitbake -c update_crates nerves-hub-link-agent` regenerates the crate list
+after a `Cargo.lock` change.
 
 ## TLS
 

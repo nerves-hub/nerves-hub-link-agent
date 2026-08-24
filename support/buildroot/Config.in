@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_NERVESHUB_PATH/package/nerves-hub-link-agent/Config.in"

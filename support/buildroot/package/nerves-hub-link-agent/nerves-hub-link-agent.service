@@ -1,0 +1,22 @@
+[Unit]
+Description=NervesHub device agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nerves-hub-link-agent --config /etc/nerves-hub-link-agent.toml
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=nerves_hub_link_agent=info
+
+# The agent downloads from the network and runs support scripts, so it does not
+# run as root. RuntimeDirectory gives it /run/nerves-hub-link-agent for the IPC
+# socket, owned by this user and recreated each boot.
+User=agent
+Group=agent
+RuntimeDirectory=nerves-hub-link-agent
+StateDirectory=nerves-hub-link-agent
+
+[Install]
+WantedBy=multi-user.target

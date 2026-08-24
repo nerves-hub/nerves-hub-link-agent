@@ -2,7 +2,12 @@
 name = "nerves-hub-link-agent"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+# Tested in CI, not guessed. 1.77 was declared here and was never true: the
+# dependency tree needs 1.88 (icu_* through idna, and edition2024 crates in the
+# lock that older cargo cannot even vendor). This also decides which Buildroot
+# and Yocto releases can build the agent -- Buildroot ships 1.88 from 2025.08,
+# so raising this pushes integrators onto a newer release.
+rust-version = "1.88"
 description = "NervesHub device agent for Linux, with pluggable firmware update tools"
 license = "Apache-2.0"
 
