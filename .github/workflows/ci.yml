@@ -18,7 +18,7 @@ jobs:
     name: format, lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,7 +70,7 @@ jobs:
           - --no-default-features --features fwup,local-shell
           - --all-features
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -89,20 +89,25 @@ jobs:
       matrix:
         scheme: [fwup, rauc]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      # The build needs an ssh public key for the rig's authorized_keys. CI
-      # never boots the image, so a throwaway key keeps the Dockerfile honest
-      # without committing one.
-      - name: generate a throwaway rig key
+      # Two files the image build copies in: the rig's ssh public key for
+      # authorized_keys, and the certificate RAUC uses as its keyring. CI never
+      # boots the image or installs a bundle, so throwaways keep the Dockerfile
+      # honest without committing either.
+      - name: generate throwaway rig keys
         run: |
           mkdir -p tmp/keys
           ssh-keygen -t ed25519 -N '' -C ci -f tmp/keys/qemu_ed25519
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=ci-throwaway' \
+            -keyout tmp/keys/rauc-key.pem \
+            -out tmp/keys/rauc-cert.pem
 
       - name: build the ${{ matrix.scheme }} device image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           build-args: BOOT_SCHEME=${{ matrix.scheme }}

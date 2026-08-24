@@ -11,6 +11,11 @@
 //! streams into fwup's stdin without deadlocking, that `-n` progress comes back
 //! as percentages, and that the slot fwup chose is the one that changed.
 
+// The whole file drives `Fwup`, which only exists when the feature does.
+// Without this, `--features rauc` fails to build its test targets on a
+// module that a rauc-only device would never carry.
+#![cfg(feature = "fwup")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};

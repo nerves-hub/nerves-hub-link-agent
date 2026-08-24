@@ -173,6 +173,11 @@ pub struct Agent {
     logs: Option<mpsc::Receiver<serde_json::Value>>,
     #[cfg(feature = "local-shell")]
     shell: Option<ShellSession>,
+    /// Always present so the select arm below does not need its own `cfg`.
+    /// `recv_shell` parks forever on this variant, which is the same thing it
+    /// does for a feature-enabled build with no shell running.
+    #[cfg(not(feature = "local-shell"))]
+    shell: Option<()>,
 }
 
 /// A running shell and the output still to be sent from it.
@@ -254,6 +259,8 @@ impl Agent {
             script_results: mpsc::channel(8),
             logs,
             #[cfg(feature = "local-shell")]
+            shell: None,
+            #[cfg(not(feature = "local-shell"))]
             shell: None,
         })
     }
