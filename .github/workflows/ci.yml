@@ -54,7 +54,7 @@ jobs:
       - run: cargo test --all-features -- --ignored
 
   features:
-    name: feature combinations
+    name: features (${{ matrix.id }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -62,20 +62,32 @@ jobs:
         # A device builds only the tool it has, so each of these is a shape
         # someone actually ships. `rauc` is the one that matters most: it is
         # not in the default set, so nothing else here compiles it.
-        features:
-          - --no-default-features --features sandbox
-          - --no-default-features --features fwup
-          - --no-default-features --features rauc
-          - --no-default-features --features rauc,local-shell
-          - --no-default-features --features fwup,local-shell
-          - --all-features
+        #
+        # `id` is carried separately because it becomes the cache key, and a
+        # cache key may not contain a comma -- with the flags used directly,
+        # the two combinations containing one failed key validation and those
+        # jobs rebuilt from scratch on every run. It reads better as a job name
+        # than the flags do, too.
+        include:
+          - id: sandbox
+            flags: --no-default-features --features sandbox
+          - id: fwup
+            flags: --no-default-features --features fwup
+          - id: rauc
+            flags: --no-default-features --features rauc
+          - id: rauc-shell
+            flags: --no-default-features --features rauc,local-shell
+          - id: fwup-shell
+            flags: --no-default-features --features fwup,local-shell
+          - id: all
+            flags: --all-features
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
-      - run: cargo check --all-targets ${{ matrix.features }}
+          key: ${{ matrix.id }}
+      - run: cargo check --all-targets ${{ matrix.flags }}
 
   images:
     name: device images
