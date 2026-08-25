@@ -315,7 +315,11 @@ impl Agent {
 
                     match link.handle(&message) {
                         Action::Joined(update) => {
-                            log::info!("joined as {} running {}", self.identifier, firmware.uuid);
+                            log::info!(
+                                "joined as {} running {}",
+                                self.identifier,
+                                firmware.uuid_or_unknown()
+                            );
                             self.set_connection(ConnectionState::Connected).await;
 
                             if link.has_extensions() {
@@ -442,7 +446,7 @@ impl Agent {
             ),
             (
                 "NERVES_HUB_FIRMWARE_UUID".to_string(),
-                firmware.uuid.clone(),
+                firmware.uuid.clone().unwrap_or_default(),
             ),
             (
                 "NERVES_HUB_FIRMWARE_VERSION".to_string(),
@@ -579,7 +583,7 @@ impl Agent {
 
         log::info!(
             "update {} -> {:?} (decided by {:?})",
-            meta.uuid,
+            meta.uuid_or_unknown(),
             decided.decision,
             decided.source
         );
@@ -646,7 +650,8 @@ impl Agent {
                     biased;
 
                     Some((stage, percent)) = incoming.recv() => {
-                        forward_progress(link, transport, ipc, &meta.uuid, stage, percent).await?;
+                        forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
+                            .await?;
                     }
 
                     finished = &mut install => break finished,
@@ -656,7 +661,8 @@ impl Agent {
             // The sender is dropped with the closure when the install ends, so
             // this terminates on whatever was still queued.
             while let Some((stage, percent)) = incoming.recv().await {
-                forward_progress(link, transport, ipc, &meta.uuid, stage, percent).await?;
+                forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
+                    .await?;
             }
 
             outcome
@@ -666,7 +672,7 @@ impl Agent {
             Ok(installed) => {
                 log::info!(
                     "installed {} ({} bytes transferred)",
-                    installed.firmware.uuid,
+                    installed.firmware.uuid_or_unknown(),
                     installed.bytes_transferred
                 );
 

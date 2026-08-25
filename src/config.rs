@@ -502,6 +502,25 @@ pub struct RaucConfig {
     /// two deliberate acts to give up both.
     #[serde(default)]
     pub tls_no_verify: bool,
+    /// Where the image records which firmware it is.
+    ///
+    /// RAUC records a bundle hash only against a slot *it* installed, so a
+    /// device flashed at the factory — UUU, dd, a card image — has none and
+    /// cannot say what it is running. A file written into the rootfs by the
+    /// image build has neither problem: it is replaced atomically with the slot
+    /// it describes, so it cannot drift from it, and it is there from the first
+    /// boot however the bytes arrived.
+    ///
+    /// `key=value` lines: uuid, version, product, platform, architecture.
+    ///
+    /// Falls back to the installed bundle's hash when the file is absent, which
+    /// is what images built before this shipped will do.
+    #[serde(default = "default_firmware_file")]
+    pub firmware_file: PathBuf,
+}
+
+fn default_firmware_file() -> PathBuf {
+    PathBuf::from("/etc/nerves-hub/firmware")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
