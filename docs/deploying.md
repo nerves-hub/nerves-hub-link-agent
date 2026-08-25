@@ -220,8 +220,9 @@ and the fwup.conf that defines the A/B layout. See [fwup.md](fwup.md).
 ## Yocto
 
 The layer is [meta-nerveshub](https://github.com/nerves-hub/meta-nerveshub), a
-repository of its own. It pins the agent with `SRCREV`, so bumping it is a
-separate step from releasing the agent.
+repository of its own. It builds a released version of the agent, so which
+version an image carries is a property of the layer rather than of this
+repository.
 
 ```bash
 ./build-test.sh parse    # layers and recipe parse
