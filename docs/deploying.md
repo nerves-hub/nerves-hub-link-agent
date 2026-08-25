@@ -219,12 +219,15 @@ and the fwup.conf that defines the A/B layout. See [fwup.md](fwup.md).
 
 ## Yocto
 
-The layer is [`support/yocto/meta-nerveshub/`](../support/yocto/meta-nerveshub/).
+The layer is [meta-nerveshub](https://github.com/nerves-hub/meta-nerveshub), a
+repository of its own. It builds a released version of the agent, so which
+version an image carries is a property of the layer rather than of this
+repository.
 
 ```bash
-./support/yocto/build-test.sh parse    # layers and recipe parse
-./support/yocto/build-test.sh fetch    # also every crate, checksums included
-./support/yocto/build-test.sh build    # also compile
+./build-test.sh parse    # layers and recipe parse
+./build-test.sh fetch    # also every crate, checksums included
+./build-test.sh build    # also compile
 ```
 
 Verified on **scarthgap**, the current LTS. The package it produces:
