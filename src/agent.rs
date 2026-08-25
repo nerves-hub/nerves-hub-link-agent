@@ -662,7 +662,7 @@ impl Agent {
             // this terminates on whatever was still queued.
             while let Some((stage, percent)) = incoming.recv().await {
                 forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
-                            .await?;
+                    .await?;
             }
 
             outcome

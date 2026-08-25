@@ -730,7 +730,10 @@ mod tests {
     fn our_own_naming_wins_when_both_are_present() {
         let env = parse_env("fw_uuid=ours\nnerves_fw_uuid=theirs\n");
 
-        assert_eq!(metadata_from_env(&env, None).unwrap().uuid, Some("ours".to_string()));
+        assert_eq!(
+            metadata_from_env(&env, None).unwrap().uuid,
+            Some("ours".to_string())
+        );
     }
 
     /// Calls the production function rather than restating it. The previous
@@ -770,7 +773,10 @@ mod tests {
 
         // An image from before per-slot metadata. Asking for slot a falls back
         // rather than failing.
-        assert_eq!(metadata_from_env(&env, Some("a")).unwrap().uuid, Some("abc".to_string()));
+        assert_eq!(
+            metadata_from_env(&env, Some("a")).unwrap().uuid,
+            Some("abc".to_string())
+        );
     }
 
     #[test]

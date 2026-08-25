@@ -416,7 +416,10 @@ mod tests {
         match link.handle(&reply) {
             Action::Joined(update) => {
                 let update = update.expect("an update was offered at join");
-                assert_eq!(update.firmware_meta.unwrap().uuid, Some("def-456".to_string()));
+                assert_eq!(
+                    update.firmware_meta.unwrap().uuid,
+                    Some("def-456".to_string())
+                );
             }
             other => panic!("expected Joined, got {other:?}"),
         }

@@ -646,7 +646,10 @@ mod tests {
         // server have stopped agreeing about what firmware is installed.
         let meta = metadata_from_status(&status()).unwrap();
 
-        assert_eq!(meta.uuid, Some("65547c89-8185-3d08-7e73-551be4c47401".to_string()));
+        assert_eq!(
+            meta.uuid,
+            Some("65547c89-8185-3d08-7e73-551be4c47401".to_string())
+        );
     }
 
     #[test]
@@ -657,7 +660,10 @@ mod tests {
         // has no such row -- so the agent reports the architecture it was
         // compiled for, which is necessarily the device's.
         assert_eq!(
-            metadata_from_status(&status()).unwrap().architecture.as_deref(),
+            metadata_from_status(&status())
+                .unwrap()
+                .architecture
+                .as_deref(),
             Some(std::env::consts::ARCH)
         );
     }
