@@ -139,6 +139,10 @@ ARG BOOT_SCHEME=fwup
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         systemd systemd-sysv \
+        # A device whose clock drifts stops being able to authenticate: the
+        # shared-secret signature carries a timestamp NervesHub rejects when
+        # stale. trixie-slim ships no time synchronisation at all.
+        systemd-timesyncd \
         linux-image-arm64 \
         ca-certificates sudo \
         libarchive13 libconfuse2 libsodium23 \

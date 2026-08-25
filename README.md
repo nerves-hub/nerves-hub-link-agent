@@ -74,7 +74,7 @@ and no self-signed certificate to work around. The separate device endpoint on
 
 | | |
 | --- | --- |
-| `401 Unauthorized` | right path, secret rejected. Check the key and secret, and that the device clock is roughly right: the signature carries a timestamp the server will not accept when stale |
+| `401 Unauthorized` | right path, secret rejected. Check the key and secret, and **check the clock**: the signature carries a timestamp the server refuses when it is more than 90 seconds stale, so a device whose clock has drifted fails in a way that reads exactly like a bad secret |
 | `403 Forbidden` | you are on `/socket`, which on port 4000 is the *user* socket |
 | connection refused | wrong port, or the server is not up |
 

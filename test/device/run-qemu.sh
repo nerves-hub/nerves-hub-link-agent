@@ -46,6 +46,12 @@ args=(
     -cpu host
     -smp 2
     -m 2048
+    # The guest takes its time from the host and keeps taking it. Without this
+    # it free-runs, and a VM left up while the host sleeps wakes an hour behind
+    # -- which NervesHub rejects as `401 Unauthorized`, because the HMAC
+    # signature carries a timestamp and the server will not accept a stale one.
+    # It reads as a bad shared secret and is not.
+    -rtc base=utc,clock=host
     # Real u-boot, which reads the environment off the disk and decides which
     # slot to boot. Nothing here names a kernel or a slot — that is the whole
     # difference from booting `-kernel` directly, and it is what makes rollback
