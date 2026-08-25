@@ -211,8 +211,10 @@ max_lines_per_second = 5
 # runs as, and the device does not get to ask who is on the other end — the
 # authorization happened entirely in NervesHub.
 #
-# It is also gated at build time by the `local-shell` cargo feature, so a binary
-# built without it cannot be talked into serving a shell by a config file.
+# Two things have to agree before a shell exists: this, and NervesHub attaching
+# the extension. Both are runtime decisions on purpose. A device worth getting a
+# shell on is usually one that is already misbehaving, and requiring a firmware
+# update to enable one would put the tool behind the problem it exists for.
 enabled = false
 command = "/bin/sh"
 chunk_bytes = 4096
