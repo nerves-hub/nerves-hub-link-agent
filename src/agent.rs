@@ -491,43 +491,15 @@ impl Agent {
                 Err(e) => log::warn!("geo: {e}"),
             },
 
-            Incoming::ShellRequested => {
-                // Dropping any previous session kills it first. The platform
-                // asks again when a second user opens the tab, and two shells
-                // writing into one stream is unreadable for both.
-                self.shell = None;
-
-                match crate::extensions::local_shell::Shell::spawn(
+            Incoming::ShellRequested | Incoming::ShellInput(_) | Incoming::WindowSize { .. } => {
+                serve_shell(
+                    &mut self.shell,
                     &self.config.extensions.local_shell,
-                ) {
-                    Ok((shell, output)) => self.shell = Some(ShellSession { shell, output }),
-                    Err(e) => {
-                        log::error!("{e}");
-
-                        transport
-                            .send(&link.extension(
-                                "local_shell:shell_output",
-                                json!({ "data": format!("\r\nagent could not start a shell: {e}\r\n") }),
-                            ))
-                            .await?;
-                    }
-                }
-            }
-
-            Incoming::ShellInput(data) => {
-                if let Some(session) = &self.shell {
-                    if let Err(e) = session.shell.input(data).await {
-                        log::warn!("{e}");
-                    }
-                }
-            }
-
-            Incoming::WindowSize { rows, cols } => {
-                if let Some(session) = &self.shell {
-                    if let Err(e) = session.shell.resize(rows, cols) {
-                        log::warn!("{e}");
-                    }
-                }
+                    link,
+                    transport,
+                    incoming,
+                )
+                .await?;
             }
         }
 
@@ -617,7 +589,13 @@ impl Agent {
             // Borrowed field by field so the install can hold `&mut self.tool`
             // while the arm below still reaches `self.ipc`.
             let Self {
-                tool, http, ipc, ..
+                tool,
+                http,
+                ipc,
+                logs,
+                shell,
+                config,
+                ..
             } = self;
 
             let install = tool.install(&update, http, move |stage, percent| {
@@ -626,6 +604,13 @@ impl Agent {
 
             tokio::pin!(install);
 
+            // Everything the session loop serves, served here too.
+            //
+            // An install used to be the only thing this loop attended to, which
+            // meant a device stopped answering for the whole of one: no logs, no
+            // shell, nothing but a percentage. That is precisely backwards. An
+            // update is when a device is most likely to be doing something
+            // unexpected, and it is the moment someone most wants to look at it.
             let outcome = loop {
                 tokio::select! {
                     // Biased so a report queued in the same tick as the install
@@ -635,6 +620,60 @@ impl Agent {
 
                     Some((stage, percent)) = incoming.recv() => {
                         forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
+                            .await?;
+                    }
+
+                    message = transport.recv() => {
+                        match message? {
+                            // The socket went away mid-install. The install
+                            // itself keeps running -- it is rauc or fwup writing
+                            // to a slot, and interrupting that is worse than
+                            // finishing it -- but this session is over.
+                            None => break Err(Error::Connection(
+                                "connection closed during install".into(),
+                            )),
+
+                            Some(message) => match link.handle(&message) {
+                                Action::Extension(incoming) => {
+                                    serve_shell(
+                                        shell,
+                                        &config.extensions.local_shell,
+                                        link,
+                                        transport,
+                                        incoming,
+                                    )
+                                    .await?;
+                                }
+
+                                // One at a time. Starting a second install over
+                                // a running one would have two writers on the
+                                // same slot.
+                                Action::ApplyUpdate(_) => log::warn!(
+                                    "an update is already installing; ignoring the new one"
+                                ),
+
+                                // Rebooting now would leave a half-written slot.
+                                Action::Reboot => log::warn!(
+                                    "asked to reboot mid-install; ignoring until it finishes"
+                                ),
+
+                                _ => {}
+                            },
+                        }
+                    }
+
+                    line = recv_log(logs) => {
+                        if link.extension_attached(crate::extensions::LOGGING) {
+                            transport.send(&link.extension("logging:send", line)).await?;
+                        }
+                    }
+
+                    output = recv_shell(shell) => {
+                        transport
+                            .send(&link.extension(
+                                "local_shell:shell_output",
+                                json!({ "data": output }),
+                            ))
                             .await?;
                     }
 
@@ -834,6 +873,71 @@ async fn recv_log(logs: &mut Option<mpsc::Receiver<serde_json::Value>>) -> serde
         },
         None => std::future::pending().await,
     }
+}
+
+/// The shell half of `on_extension`, taking only the pieces it needs.
+///
+/// A free function rather than a method because an install borrows
+/// `&mut self.tool` for its whole duration, which rules out calling any
+/// `&mut self` method while one runs. The install loop serves the shell by
+/// passing the fields it destructured, and a shell is wanted exactly when an
+/// update is misbehaving.
+async fn serve_shell(
+    shell: &mut Option<ShellSession>,
+    config: &crate::config::LocalShellConfig,
+    link: &mut Link,
+    transport: &mut Transport,
+    incoming: Incoming,
+) -> Result<(), Error> {
+    match incoming {
+        Incoming::ShellRequested => {
+            // Dropping any previous session kills it first. The platform asks
+            // again when a second user opens the tab, and two shells writing
+            // into one stream is unreadable for both.
+            *shell = None;
+
+            match crate::extensions::local_shell::Shell::spawn(config) {
+                Ok((spawned, output)) => {
+                    *shell = Some(ShellSession {
+                        shell: spawned,
+                        output,
+                    })
+                }
+                Err(e) => {
+                    log::error!("{e}");
+
+                    transport
+                        .send(&link.extension(
+                            "local_shell:shell_output",
+                            json!({ "data": format!("\r\nagent could not start a shell: {e}\r\n") }),
+                        ))
+                        .await?;
+                }
+            }
+        }
+
+        Incoming::ShellInput(data) => {
+            if let Some(session) = shell {
+                if let Err(e) = session.shell.input(data).await {
+                    log::warn!("{e}");
+                }
+            }
+        }
+
+        Incoming::WindowSize { rows, cols } => {
+            if let Some(session) = shell {
+                if let Err(e) = session.shell.resize(rows, cols) {
+                    log::warn!("{e}");
+                }
+            }
+        }
+
+        // The reading extensions need `&mut self` and stay in `on_extension`;
+        // nothing routes them here.
+        _ => {}
+    }
+
+    Ok(())
 }
 
 async fn recv_shell(shell: &mut Option<ShellSession>) -> String {
