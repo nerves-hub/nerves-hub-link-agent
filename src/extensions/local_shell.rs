@@ -64,6 +64,17 @@ impl Shell {
         // escape sequences the browser terminal is there to render.
         command.env("TERM", "xterm-256color");
 
+        // Say where to start, rather than letting the pty crate fall back to
+        // $HOME.
+        //
+        // A service user is very often created with --no-create-home while its
+        // passwd entry still names one, so $HOME is a directory that does not
+        // exist. Spawning with a working directory that is not there fails with
+        // ENOENT, and the error names the *command* -- so a perfectly good
+        // /bin/sh is reported missing and the search goes looking for the wrong
+        // thing entirely.
+        command.cwd(working_directory());
+
         let child = pair
             .slave
             .spawn_command(command)
@@ -147,6 +158,18 @@ impl Drop for Shell {
     }
 }
 
+/// Where to start the shell.
+///
+/// `$HOME` when it is a directory that exists, because landing somewhere
+/// useful is worth having, and `/` otherwise. `/` is the one directory that
+/// cannot be missing.
+fn working_directory() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_dir())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
 /// Read the pty on a blocking thread, forwarding whole UTF-8 sequences.
 ///
 /// The carry buffer matters: a read can land in the middle of a multi-byte
@@ -219,6 +242,27 @@ fn take_complete(carry: &mut Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_missing_home_does_not_decide_where_the_shell_starts() {
+        // The failure this guards against reported "/bin/sh: No such file or
+        // directory" on a device where /bin/sh was present and $HOME was not.
+        // A service user created with --no-create-home whose passwd entry still
+        // names a home is the ordinary case, not an exotic one.
+        let previous = std::env::var_os("HOME");
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::set_var("HOME", "/definitely/not/a/directory") };
+
+        assert_eq!(working_directory(), std::path::PathBuf::from("/"));
+
+        unsafe {
+            match previous {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
