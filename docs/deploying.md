@@ -102,14 +102,15 @@ For musl, `aarch64-unknown-linux-musl` produces a static binary that needs
 nothing on the target at all.
 
 **Build only the tool the device has.** The features exist so an image that will
-never see a RAUC bundle does not carry the code to install one, and so a build
-without `local-shell` cannot be talked into serving a shell:
+never see a RAUC bundle does not carry the code to install one:
 
 ```
 --no-default-features --features fwup
 --no-default-features --features rauc
---no-default-features --features rauc,local-shell
 ```
+
+The local shell is not among them. It is always built, and turned on in the
+configuration — see [`examples/agent.toml`](../examples/agent.toml).
 
 `sandbox` is in the default set on purpose — a build that has not been told
 which real updater to use should not be able to write to a disk — so

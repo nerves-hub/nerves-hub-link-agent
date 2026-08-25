@@ -93,10 +93,6 @@ jobs:
             flags: --no-default-features --features fwup
           - id: rauc
             flags: --no-default-features --features rauc
-          - id: rauc-shell
-            flags: --no-default-features --features rauc,local-shell
-          - id: fwup-shell
-            flags: --no-default-features --features fwup,local-shell
           - id: all
             flags: --all-features
     steps:

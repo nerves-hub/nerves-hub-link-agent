@@ -195,8 +195,10 @@ worse, but it does mean health is one of the things you need a container for.
 
 **local_shell hands out a shell.** Whoever can open the tab in NervesHub runs
 commands as whatever the agent runs as, and the device does not get to ask who
-they are. It is gated behind the `local-shell` cargo feature as well as config,
-so a binary built without it cannot be talked into serving one.
+they are. It is off unless the config turns it on *and* NervesHub attaches it,
+and both are runtime decisions: a device that needs looking at is one you can
+already no longer reach, and having to ship it a firmware update first to get a
+shell would put the tool behind the problem it exists for.
 
 Both QEMU rigs turn it on, because a throwaway VM on a loopback port is the only
 place it can be exercised: it needs a real pty, a real terminal attached from

@@ -108,7 +108,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 ] }
 http-body-util = "0.1"
 bytes = "1"
-portable-pty = { version = "0.9", optional = true }
+portable-pty = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
@@ -118,7 +118,7 @@ tokio = { version = "1", features = ["rt", "macros", "process"] }
 [features]
 # The sandbox tool is in the default set deliberately: a build that has not
 # been told which real updater to use should not be able to write to a disk.
-default = ["sandbox", "fwup", "local-shell"]
+default = ["sandbox", "fwup"]
 
 sandbox = []
 fwup = []
@@ -128,4 +128,3 @@ rauc = []
 # the one that matters: it is the only extension that lets someone reach into
 # the device rather than read from it, and a build that cannot serve a shell
 # cannot be talked into serving one by a config file.
-local-shell = ["dep:portable-pty"]

@@ -171,17 +171,10 @@ pub struct Agent {
     /// Log lines waiting to be shipped. `None` when the extension is off, in
     /// which case nothing is tailing anything.
     logs: Option<mpsc::Receiver<serde_json::Value>>,
-    #[cfg(feature = "local-shell")]
     shell: Option<ShellSession>,
-    /// Always present so the select arm below does not need its own `cfg`.
-    /// `recv_shell` parks forever on this variant, which is the same thing it
-    /// does for a feature-enabled build with no shell running.
-    #[cfg(not(feature = "local-shell"))]
-    shell: Option<()>,
 }
 
 /// A running shell and the output still to be sent from it.
-#[cfg(feature = "local-shell")]
 struct ShellSession {
     shell: crate::extensions::local_shell::Shell,
     output: mpsc::Receiver<String>,
@@ -242,9 +235,6 @@ impl Agent {
             network_identity,
             script_results: mpsc::channel(8),
             logs,
-            #[cfg(feature = "local-shell")]
-            shell: None,
-            #[cfg(not(feature = "local-shell"))]
             shell: None,
         })
     }
@@ -501,7 +491,6 @@ impl Agent {
                 Err(e) => log::warn!("geo: {e}"),
             },
 
-            #[cfg(feature = "local-shell")]
             Incoming::ShellRequested => {
                 // Dropping any previous session kills it first. The platform
                 // asks again when a second user opens the tab, and two shells
@@ -525,7 +514,6 @@ impl Agent {
                 }
             }
 
-            #[cfg(feature = "local-shell")]
             Incoming::ShellInput(data) => {
                 if let Some(session) = &self.shell {
                     if let Err(e) = session.shell.input(data).await {
@@ -534,7 +522,6 @@ impl Agent {
                 }
             }
 
-            #[cfg(feature = "local-shell")]
             Incoming::WindowSize { rows, cols } => {
                 if let Some(session) = &self.shell {
                     if let Err(e) = session.shell.resize(rows, cols) {
@@ -542,9 +529,6 @@ impl Agent {
                     }
                 }
             }
-
-            #[cfg(not(feature = "local-shell"))]
-            other => log::debug!("ignoring {other:?}: built without local-shell"),
         }
 
         Ok(())
@@ -852,7 +836,6 @@ async fn recv_log(logs: &mut Option<mpsc::Receiver<serde_json::Value>>) -> serde
     }
 }
 
-#[cfg(feature = "local-shell")]
 async fn recv_shell(shell: &mut Option<ShellSession>) -> String {
     match shell {
         Some(session) => match session.output.recv().await {
@@ -866,11 +849,6 @@ async fn recv_shell(shell: &mut Option<ShellSession>) -> String {
         },
         None => std::future::pending().await,
     }
-}
-
-#[cfg(not(feature = "local-shell"))]
-async fn recv_shell(_shell: &mut Option<()>) -> String {
-    std::future::pending().await
 }
 
 /// The keys the fwup reader on the server understands.

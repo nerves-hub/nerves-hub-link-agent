@@ -51,7 +51,6 @@
 
 pub mod geo;
 pub mod health;
-#[cfg(feature = "local-shell")]
 pub mod local_shell;
 pub mod logging;
 pub mod network_identity;
@@ -120,10 +119,9 @@ impl Extensions {
             offered.push(NETWORK_IDENTITY);
         }
 
-        // Offered only if this binary can actually serve one. Advertising a
-        // shell and then failing to produce it leaves an operator staring at a
-        // blank terminal with nothing to read.
-        #[cfg(feature = "local-shell")]
+        // Config and the platform both have to want it. The device is never
+        // the only thing standing between a NervesHub user and a shell, but it
+        // is one of them.
         if config.local_shell.enabled {
             offered.push(LOCAL_SHELL);
         }
