@@ -104,7 +104,7 @@ systemd unit, and Buildroot and Yocto packaging — see
 which is the main reason TLS is rustls rather than the system OpenSSL.
 
 A Buildroot br2-external tree is in [`support/buildroot/`](support/buildroot/)
-and a Yocto layer in [`support/yocto/`](support/yocto/), each with a script that
+and the Yocto layer in [meta-nerveshub][meta-nerveshub], each with a script that
 builds it in a container. Both produce a working package: Buildroot against
 2025.08, Yocto against scarthgap. The Yocto layer requires
 [meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) for the
@@ -316,3 +316,5 @@ daemon that a minimal single-purpose image often does not run.
 **Client certificates.** NervesHub supports them and they are the better answer
 for a device that can hold a per-device key. The config shape is written down in
 `examples/agent.toml`; nothing behind it is implemented.
+
+[meta-nerveshub]: https://github.com/nerves-hub/meta-nerveshub
