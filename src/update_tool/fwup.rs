@@ -272,7 +272,11 @@ impl Fwup {
             }
         }
 
-        log::info!("fwup applied {} ({} bytes)", meta.uuid, transferred.bytes);
+        log::info!(
+            "fwup applied {} ({} bytes)",
+            meta.uuid_or_unknown(),
+            transferred.bytes
+        );
 
         Ok(Installed {
             firmware: meta,
@@ -545,6 +549,15 @@ fn metadata_from_env(
         })
     };
 
+    // Still fatal here, unlike RAUC.
+    //
+    // fwup's metadata all comes from the same U-Boot environment, so an absent
+    // uuid means the environment was not written by fwup and version, platform
+    // and architecture are absent with it -- there is nothing to report and
+    // nothing a deployment could match. RAUC is the opposite case: its
+    // `compatible` comes from system.conf and is always there, and the
+    // architecture comes from the binary, so a slot with no recorded bundle
+    // can still be matched and updated.
     let uuid = get("uuid").ok_or_else(|| Error::UpdateTool {
         tool: "fwup",
         message: match slot {
@@ -556,7 +569,7 @@ fn metadata_from_env(
     })?;
 
     Ok(FirmwareMeta {
-        uuid,
+        uuid: Some(uuid),
         version: get("version"),
         product: get("product"),
         platform: get("platform"),
@@ -677,7 +690,7 @@ mod tests {
 
         let meta = metadata_from_env(&env, None).unwrap();
 
-        assert_eq!(meta.uuid, "abc-123");
+        assert_eq!(meta.uuid, Some("abc-123".to_string()));
         // Quoted values are unwrapped — fw_printenv does not quote, but a file
         // written by a shell script very often does.
         assert_eq!(meta.version.as_deref(), Some("1.2.3"));
@@ -709,7 +722,7 @@ mod tests {
         let env = parse_env("nerves_fw_uuid=abc\nnerves_fw_version=1.0.0\n");
         let meta = metadata_from_env(&env, None).unwrap();
 
-        assert_eq!(meta.uuid, "abc");
+        assert_eq!(meta.uuid, Some("abc".to_string()));
         assert_eq!(meta.version.as_deref(), Some("1.0.0"));
     }
 
@@ -717,7 +730,7 @@ mod tests {
     fn our_own_naming_wins_when_both_are_present() {
         let env = parse_env("fw_uuid=ours\nnerves_fw_uuid=theirs\n");
 
-        assert_eq!(metadata_from_env(&env, None).unwrap().uuid, "ours");
+        assert_eq!(metadata_from_env(&env, None).unwrap().uuid, Some("ours".to_string()));
     }
 
     /// Calls the production function rather than restating it. The previous
@@ -741,14 +754,14 @@ mod tests {
 
         let rolled_back = metadata_from_env(&env, Some("a")).unwrap();
 
-        assert_eq!(rolled_back.uuid, "aaaa");
+        assert_eq!(rolled_back.uuid, Some("aaaa".to_string()));
         assert_eq!(rolled_back.version.as_deref(), Some("1.0.0"));
 
         // And trusting the environment instead would report the firmware that
         // just failed as the one running.
         let believed = metadata_from_env(&env, Some("b")).unwrap();
 
-        assert_eq!(believed.uuid, "bbbb");
+        assert_eq!(believed.uuid, Some("bbbb".to_string()));
     }
 
     #[test]
@@ -757,7 +770,7 @@ mod tests {
 
         // An image from before per-slot metadata. Asking for slot a falls back
         // rather than failing.
-        assert_eq!(metadata_from_env(&env, Some("a")).unwrap().uuid, "abc");
+        assert_eq!(metadata_from_env(&env, Some("a")).unwrap().uuid, Some("abc".to_string()));
     }
 
     #[test]

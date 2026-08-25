@@ -375,7 +375,7 @@ mod tests {
     #[allow(dead_code)]
     fn firmware() -> FirmwareMeta {
         FirmwareMeta {
-            uuid: "abc-123".into(),
+            uuid: Some("abc-123".into()),
             version: Some("1.0.0".into()),
             product: Some("gateway".into()),
             platform: Some("rpi4".into()),
@@ -416,7 +416,7 @@ mod tests {
         match link.handle(&reply) {
             Action::Joined(update) => {
                 let update = update.expect("an update was offered at join");
-                assert_eq!(update.firmware_meta.unwrap().uuid, "def-456");
+                assert_eq!(update.firmware_meta.unwrap().uuid, Some("def-456".to_string()));
             }
             other => panic!("expected Joined, got {other:?}"),
         }

@@ -91,7 +91,16 @@ pub struct UpdatePayload {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct FirmwareMeta {
-    pub uuid: String,
+    /// Which firmware this is, when that is knowable.
+    ///
+    /// `None` for a device whose slot was written by something other than its
+    /// update tool -- a RAUC slot flashed at the factory with UUU or dd has no
+    /// bundle recorded against it. Such a device still knows its version,
+    /// platform and architecture, which is what NervesHub matches deployments
+    /// on, so it can be enrolled and updated. Refusing to report at all left it
+    /// unable to receive the update that would give it a uuid.
+    #[serde(default)]
+    pub uuid: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -100,6 +109,14 @@ pub struct FirmwareMeta {
     pub platform: Option<String>,
     #[serde(default)]
     pub architecture: Option<String>,
+}
+
+impl FirmwareMeta {
+    /// The uuid for logs, environment variables and progress messages, where
+    /// there has to be *something* to print.
+    pub fn uuid_or_unknown(&self) -> &str {
+        self.uuid.as_deref().unwrap_or("unknown")
+    }
 }
 
 /// Where an update is in its lifecycle. Sent as the `stage` of an

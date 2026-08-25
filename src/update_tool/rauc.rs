@@ -303,7 +303,7 @@ impl Rauc {
             });
         }
 
-        log::info!("rauc installed {}", meta.uuid);
+        log::info!("rauc installed {}", meta.uuid_or_unknown());
 
         Ok(Installed {
             firmware: meta,
@@ -378,6 +378,55 @@ fn booted_slot(status: &Value) -> Option<&Value> {
         .find(|slot| slot.get("state").and_then(Value::as_str) == Some("booted"))
 }
 
+/// The metadata NervesHub needs, from the image's own record of itself.
+///
+/// `Ok(None)` when there is no such file, which is not an error: an image built
+/// before this existed reports from its installed bundle instead.
+///
+/// A uuid here is a *declared* one — the build wrote the same value into the
+/// bundle manifest's `[meta.nerveshub]` section, so NervesHub records the
+/// identifier the device reports. That is what a derived uuid cannot be: it
+/// hashes the manifest, which covers the rootfs, so it cannot live inside the
+/// rootfs it identifies.
+fn metadata_from_file(path: &std::path::Path) -> Result<Option<FirmwareMeta>, std::io::Error> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let mut fields = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim();
+            if !value.is_empty() {
+                fields.insert(key.trim().to_string(), value.to_string());
+            }
+        }
+    }
+
+    // A file with no uuid in it is not an identity. Treated as absent so the
+    // bundle hash still gets a chance, rather than reporting a firmware with
+    // nothing to identify it.
+    if !fields.contains_key("uuid") {
+        return Ok(None);
+    }
+
+    let take = |key: &str| fields.get(key).cloned();
+
+    Ok(Some(FirmwareMeta {
+        uuid: take("uuid"),
+        version: take("version"),
+        product: take("product"),
+        platform: take("platform"),
+        architecture: take("architecture"),
+    }))
+}
+
 /// The metadata NervesHub needs, from the booted slot's recorded bundle.
 ///
 /// `architecture` is deliberately absent. RAUC records `compatible`, `version`,
@@ -394,16 +443,24 @@ fn metadata_from_status(status: &Value) -> Result<FirmwareMeta, Error> {
 
     let bundle = slot.get("slot_status").and_then(|s| s.get("bundle"));
 
-    let hash = bundle
-        .and_then(|b| b.get("hash"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::UpdateTool {
-            tool: "rauc",
-            message: "the booted slot records no bundle hash, so this device cannot say \
-                      which firmware it is running. A slot written by something other than \
-                      `rauc install` has no bundle recorded against it."
-                .into(),
-        })?;
+    // A missing bundle hash is not an error.
+    //
+    // RAUC records one only against a slot *it* installed, so a device flashed
+    // at the factory with UUU or dd has none. That device still knows its
+    // compatible and its architecture, which is what NervesHub matches
+    // deployments on -- so it can be enrolled and sent its first update, which
+    // is precisely what gives it a hash. Treating this as fatal deadlocked
+    // enrolment on the thing enrolment would have fixed.
+    let hash = bundle.and_then(|b| b.get("hash")).and_then(Value::as_str);
+
+    if hash.is_none() {
+        log::warn!(
+            "the booted slot records no bundle hash, so this device cannot say which \
+             firmware it is running -- a slot written by something other than \
+             `rauc install` has none. Reporting platform and architecture only; the \
+             first RAUC update will fill it in."
+        );
+    }
 
     let string = |key: &str| {
         bundle
@@ -412,16 +469,29 @@ fn metadata_from_status(status: &Value) -> Result<FirmwareMeta, Error> {
             .map(str::to_string)
     };
 
-    let compatible = string("compatible");
+    // From the bundle when there is one, otherwise the running system's own,
+    // which is what a device with no recorded bundle has to fall back on.
+    let compatible = string("compatible").or_else(|| {
+        status
+            .get("compatible")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
 
     Ok(FirmwareMeta {
-        uuid: uuid_from_hash(hash)?,
+        uuid: hash.map(uuid_from_hash).transpose()?,
         version: string("version"),
         // `compatible` is the closest RAUC has to either, and it is what
         // NervesHub's server side records as the platform.
         platform: compatible.clone(),
         product: compatible,
-        architecture: None,
+        // The architecture this binary was compiled for, which is necessarily
+        // the device's. RAUC does not carry it into slot status -- it lives in
+        // the manifest's `[meta.nerveshub]` section, a build-time thing -- and
+        // the server can only fill it in from a firmware row matched by uuid.
+        // A device without a uuid has no such row, and architecture is half of
+        // what deployment matching needs, so it is reported from here instead.
+        architecture: Some(std::env::consts::ARCH.to_string()),
     })
 }
 
@@ -458,7 +528,28 @@ impl UpdateTool for Rauc {
     }
 
     fn current_firmware(&self) -> Result<FirmwareMeta, Error> {
-        metadata_from_status(&self.status()?)
+        // The image's own record first.
+        //
+        // It is written by the build into the rootfs, so it is present from the
+        // first boot however the device was flashed, and it is replaced with the
+        // slot it describes rather than living alongside it on a data partition
+        // where it could drift.
+        //
+        // RAUC's slot status is the fallback, for images built before this
+        // existed. It stays authoritative for boot state, which is what it is
+        // actually for.
+        match metadata_from_file(&self.config.firmware_file) {
+            Ok(Some(meta)) => Ok(meta),
+            Ok(None) => metadata_from_status(&self.status()?),
+            Err(e) => {
+                log::warn!(
+                    "{} could not be read ({e}); falling back to the installed \
+                     bundle's hash",
+                    self.config.firmware_file.display()
+                );
+                metadata_from_status(&self.status()?)
+            }
+        }
     }
 
     fn boot_state(&self) -> Result<BootState, Error> {
@@ -555,24 +646,54 @@ mod tests {
         // server have stopped agreeing about what firmware is installed.
         let meta = metadata_from_status(&status()).unwrap();
 
-        assert_eq!(meta.uuid, "65547c89-8185-3d08-7e73-551be4c47401");
+        assert_eq!(meta.uuid, Some("65547c89-8185-3d08-7e73-551be4c47401".to_string()));
     }
 
     #[test]
-    fn architecture_is_not_something_rauc_records() {
-        // It lived in the manifest's meta section, which is a build-time thing.
-        // NervesHub fills it in from the firmware it matched by UUID.
-        assert_eq!(metadata_from_status(&status()).unwrap().architecture, None);
+    fn architecture_comes_from_the_binary_rather_than_rauc() {
+        // RAUC does not record it: it lived in the manifest's meta section,
+        // which is a build-time thing. The server can only fill it in from a
+        // firmware row matched by UUID, and a device with no recorded bundle
+        // has no such row -- so the agent reports the architecture it was
+        // compiled for, which is necessarily the device's.
+        assert_eq!(
+            metadata_from_status(&status()).unwrap().architecture.as_deref(),
+            Some(std::env::consts::ARCH)
+        );
     }
 
     #[test]
-    fn a_slot_with_no_bundle_says_why() {
+    fn a_slot_with_no_bundle_still_reports_enough_to_be_updated() {
+        // The factory case: a slot written by UUU or dd rather than by
+        // `rauc install` has no bundle recorded against it. This used to be a
+        // hard error, which deadlocked enrolment -- the device could not report,
+        // so it could not be sent the update that would give it something to
+        // report.
         let mut status = status();
         status["slots"][1]["rootfs.0"]["slot_status"] = serde_json::json!({});
 
-        let message = metadata_from_status(&status).unwrap_err().to_string();
+        let meta = metadata_from_status(&status).unwrap();
 
-        assert!(message.contains("no bundle recorded"), "{message}");
+        // Nothing to identify *which* firmware this is, and that is honest.
+        assert_eq!(meta.uuid, None);
+
+        // But both halves of what NervesHub matches deployments on are here,
+        // which is what makes the device updatable.
+        assert_eq!(meta.platform.as_deref(), Some("acme-gateway"));
+        assert_eq!(meta.architecture.as_deref(), Some(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn the_compatible_falls_back_to_the_running_system() {
+        // With no bundle there is no bundle `compatible` to read, so it comes
+        // from the top level of `rauc status` -- the system's own, out of
+        // system.conf, which is always there.
+        let mut status = status();
+        status["slots"][1]["rootfs.0"]["slot_status"] = serde_json::json!({});
+
+        let meta = metadata_from_status(&status).unwrap();
+
+        assert_eq!(meta.product.as_deref(), Some("acme-gateway"));
     }
 
     #[test]

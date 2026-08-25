@@ -243,7 +243,7 @@ fn update(url: &str, contents: &[u8]) -> UpdatePayload {
         update_available: true,
         firmware_url: Some(url.to_string()),
         firmware_meta: Some(FirmwareMeta {
-            uuid: "test-uuid".into(),
+            uuid: Some("test-uuid".into()),
             version: Some("0.2.0".into()),
             product: Some("test-product".into()),
             platform: Some("test".into()),

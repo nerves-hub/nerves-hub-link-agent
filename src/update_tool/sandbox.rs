@@ -74,7 +74,7 @@ fn read_recorded(path: &std::path::Path) -> Option<FirmwareMeta> {
 impl From<&crate::config::SandboxFirmware> for FirmwareMeta {
     fn from(f: &crate::config::SandboxFirmware) -> Self {
         FirmwareMeta {
-            uuid: f.uuid.clone(),
+            uuid: Some(f.uuid.clone()),
             version: Some(f.version.clone()),
             product: Some(f.product.clone()),
             platform: Some(f.platform.clone()),
@@ -154,7 +154,10 @@ impl Sandbox {
             });
         }
 
-        let target = self.config.work_dir.join(format!("{}.fw", meta.uuid));
+        let target = self
+            .config
+            .work_dir
+            .join(format!("{}.fw", meta.uuid_or_unknown()));
         let mut file = tokio::fs::File::create(&target).await?;
 
         let mut response = client.get(url).await?;
@@ -226,7 +229,7 @@ impl Sandbox {
 
         log::info!(
             "sandbox: installed {} ({} bytes) to {}",
-            meta.uuid,
+            meta.uuid_or_unknown(),
             written,
             target.display()
         );
