@@ -8,26 +8,33 @@
 //!
 //! # How the negotiation works
 //!
-//! The device joins the `extensions` topic with a map of the extensions it can
-//! serve and the version of each:
+//! Four frames, and the device does not start it. The platform asks, saying
+//! which extensions it has and the versions of each; the device answers by
+//! joining the topic with the subset it also implements:
 //!
 //! ```text
+//! <- extensions:get         {"extensions": {"health": ["0.0.1"], "logging": ["0.1.0", "0.0.1"]}}
 //! -> phx_join "extensions"  {"health": "0.0.1", "logging": "0.1.0"}
 //! <- phx_reply              ["health"]
+//! -> health:attached        {}
 //! ```
 //!
-//! The version is a capability check as much as a version, and one that only
-//! goes one way: the device names a single version per extension and the
-//! platform takes it or leaves it. There is nothing in the reply to negotiate
-//! with -- it is a list of keys -- so `logging` at 0.1.0 means a NervesHub
-//! that has only the 0.0.1 extension does not attach it at all. Which the
-//! device can see and report, unlike lines dropped silently on the far side.
+//! The version is a capability check as much as a version. `logging` at 0.1.0
+//! is a different conversation than 0.0.1 -- a second's worth of lines per
+//! message rather than one -- so a platform with only the older one is not
+//! offered logging at all, rather than being sent batches it cannot read.
+//!
+//! A platform old enough not to ask never sends the first frame. Waiting for
+//! it forever would cost the device every extension it has, so the wait ends:
+//! [`crate::agent`] joins anyway a few seconds after the device topic,
+//! offering everything this agent implements, which is what such a platform
+//! has always served.
 //!
 //! The reply is the subset the *platform* wants attached, which is narrower
-//! than what the device offered: an extension can be turned off per product or
-//! per device, and one the server does not recognise is simply left out. The
-//! device then confirms each with `<key>:attached`, and only then does the
-//! server start asking it for anything.
+//! still than what the device offered: an extension can be turned off per
+//! product or per device. The device then confirms each with
+//! `<key>:attached`, and only then does the server start asking it for
+//! anything.
 //!
 //! Both halves have to agree, and either can decline. That is the point: a
 //! device that starts reporting something an operator did not ask for is worse
@@ -94,6 +101,22 @@ const VERSION: &str = "0.0.1";
 /// `~> 0.0.1`, leaves logging out of the attach list, and the device is told
 /// rather than having its batches dropped somewhere it cannot see.
 const LOGGING_VERSION: &str = "0.1.0";
+
+/// Whether to offer `key`, given what the platform advertised.
+///
+/// Anything that is not a map of key to versions is treated as no
+/// advertisement at all: a malformed message should not be worse for the
+/// device than a missing one.
+fn offering(advertisement: Option<&Value>, key: &str) -> bool {
+    let Some(Value::Object(advertised)) = advertisement else {
+        return true;
+    };
+
+    advertised
+        .get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|versions| versions.iter().any(|v| v.as_str() == Some(version(key))))
+}
 
 /// What this agent implements of `key`.
 const fn version(key: &str) -> &'static str {
@@ -165,11 +188,26 @@ impl Extensions {
         !self.offered.is_empty()
     }
 
-    /// The join payload: every offered extension and its version.
-    pub fn join_payload(&self) -> Value {
+    /// The join payload: what to offer, given what the platform said it has.
+    ///
+    /// An extension the platform did not name is left out. It either does not
+    /// implement it or an operator has switched it off, and either way there
+    /// is nothing to attach -- so a device that offers it anyway is promising
+    /// to serve something nothing will ever ask it for.
+    ///
+    /// So is one named only at versions this agent does not implement. That is
+    /// the case the version exists for: `logging` at 0.1.0 is a different
+    /// conversation than 0.0.1, and a platform with only the older one cannot
+    /// read what this agent would send.
+    ///
+    /// `None` offers everything. A platform too old to advertise still serves
+    /// the versions it always did, and a device that offered it nothing would
+    /// be trading working extensions for a message it never got.
+    pub fn join_payload(&self, advertisement: Option<&Value>) -> Value {
         let versions: BTreeMap<&str, &str> = self
             .offered
             .iter()
+            .filter(|key| offering(advertisement, key))
             .map(|key| (*key, version(key)))
             .collect();
 
@@ -263,7 +301,7 @@ mod tests {
     fn only_enabled_extensions_are_offered() {
         let extensions = Extensions::new(&config(true, false));
 
-        assert_eq!(extensions.join_payload(), json!({ "health": "0.0.1" }));
+        assert_eq!(extensions.join_payload(None), json!({ "health": "0.0.1" }));
     }
 
     #[test]
@@ -339,6 +377,78 @@ mod tests {
     }
 
     #[test]
+    fn an_extension_the_platform_did_not_name_is_not_offered() {
+        let mut config = Config::default();
+        config.health.enabled = true;
+        config.geo.enabled = true;
+
+        let extensions = Extensions::new(&config);
+        let advertised = json!({ "health": ["0.0.1"] });
+
+        assert_eq!(
+            extensions.join_payload(Some(&advertised)),
+            json!({ "health": "0.0.1" })
+        );
+    }
+
+    #[test]
+    fn an_extension_the_platform_has_only_at_another_version_is_not_offered() {
+        // The version is the whole point: 0.0.1 logging is one line per
+        // message, and this agent only speaks the batched one. Offering it
+        // anyway would have the platform attach an extension it cannot read.
+        let mut config = Config::default();
+        config.logging.enabled = true;
+        config.health.enabled = true;
+
+        let extensions = Extensions::new(&config);
+        let advertised = json!({ "logging": ["0.0.1"], "health": ["0.0.1"] });
+
+        assert_eq!(
+            extensions.join_payload(Some(&advertised)),
+            json!({ "health": "0.0.1" })
+        );
+    }
+
+    #[test]
+    fn a_version_this_agent_has_is_taken_from_a_list_of_several() {
+        let mut config = Config::default();
+        config.logging.enabled = true;
+
+        let extensions = Extensions::new(&config);
+        let advertised = json!({ "logging": ["0.1.0", "0.0.1"] });
+
+        assert_eq!(
+            extensions.join_payload(Some(&advertised)),
+            json!({ "logging": "0.1.0" })
+        );
+    }
+
+    #[test]
+    fn a_platform_that_advertises_nothing_is_offered_nothing() {
+        let mut config = Config::default();
+        config.health.enabled = true;
+
+        let extensions = Extensions::new(&config);
+
+        assert_eq!(extensions.join_payload(Some(&json!({}))), json!({}));
+    }
+
+    #[test]
+    fn an_advertisement_that_cannot_be_read_is_treated_as_none() {
+        // A malformed message should not cost the device every extension it
+        // has, which offering nothing at all would.
+        let mut config = Config::default();
+        config.health.enabled = true;
+
+        let extensions = Extensions::new(&config);
+
+        assert_eq!(
+            extensions.join_payload(Some(&json!("nonsense"))),
+            json!({ "health": "0.0.1" })
+        );
+    }
+
+    #[test]
     fn logging_declares_the_version_that_may_batch() {
         // The version is how the platform decides whether this device may send
         // many lines in one message. A NervesHub that predates batching does
@@ -348,7 +458,7 @@ mod tests {
         config.logging.enabled = true;
         config.health.enabled = true;
 
-        let payload = Extensions::new(&config).join_payload();
+        let payload = Extensions::new(&config).join_payload(None);
 
         assert_eq!(payload["logging"], "0.1.0");
         assert_eq!(payload["health"], "0.0.1");

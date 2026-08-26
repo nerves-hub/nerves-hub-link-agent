@@ -36,6 +36,14 @@ pub enum Action {
     /// The platform attached these extensions. The caller confirms each with
     /// [`Link::extension`] and starts serving them.
     ExtensionsAttached(Vec<(String, Value)>),
+    /// The platform asked what this device can serve, and said what it has.
+    /// The caller answers with [`Link::join_extensions`].
+    ///
+    /// Carries the advertisement, or `None` when the platform sent one this
+    /// agent cannot read -- which is treated the same as a platform too old to
+    /// send one at all, since a malformed message should not cost a device
+    /// every extension it has.
+    ExtensionsRequested(Option<Value>),
     /// An extension was asked for something.
     Extension(Incoming),
     /// An operator ran a support script against this device.
@@ -81,13 +89,18 @@ impl Link {
         self.extensions.is_attached(key)
     }
 
-    /// Join the extensions channel, offering what this agent can serve.
+    /// Join the extensions channel, offering what both sides can serve.
     ///
     /// Joined after the device channel, not before. Extension traffic is
     /// explicitly less important than an update, and a device that cannot get
     /// as far as reporting its firmware has nothing to gain from negotiating a
     /// health report.
-    pub fn join_extensions(&mut self) -> Message {
+    ///
+    /// `advertisement` is what the platform said it has, from
+    /// [`Action::ExtensionsRequested`]. `None` offers everything this agent
+    /// implements, which is the right answer for a platform that does not
+    /// advertise: it serves the versions it always did.
+    pub fn join_extensions(&mut self, advertisement: Option<&Value>) -> Message {
         let reference = self.refs.next_ref();
         self.extensions_join_ref = Some(reference.clone());
 
@@ -96,7 +109,7 @@ impl Link {
             reference: Some(reference),
             topic: EXTENSIONS_TOPIC.into(),
             event: event::JOIN.into(),
-            payload: self.extensions.join_payload(),
+            payload: self.extensions.join_payload(advertisement),
         }
     }
 
@@ -288,6 +301,10 @@ impl Link {
                     // without text. Both would be a server bug.
                     _ => Action::None,
                 }
+            }
+
+            event::EXTENSIONS_GET => {
+                Action::ExtensionsRequested(message.payload.get("extensions").cloned())
             }
 
             event::REBOOT => Action::Reboot,
