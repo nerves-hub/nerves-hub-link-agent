@@ -179,6 +179,11 @@ pub struct Agent {
     /// Log lines waiting to be shipped. `None` when the extension is off, in
     /// which case nothing is tailing anything.
     logs: Option<mpsc::Receiver<serde_json::Value>>,
+    /// The lines that arrived before the platform attached logging, held until
+    /// it does. Outlives a session, like the tail that fills it: the lines a
+    /// device writes while it is negotiating are the ones a reconnect is
+    /// usually about.
+    pending_logs: logging::Pending,
     shell: Option<ShellSession>,
     /// The install in flight, if there is one.
     install: Option<InstallSession>,
@@ -277,6 +282,7 @@ impl Agent {
             network_identity,
             script_results: mpsc::channel(8),
             logs,
+            pending_logs: logging::Pending::new(logging::PENDING_LINES),
             shell: None,
             install: None,
             firmware,
@@ -400,6 +406,28 @@ impl Agent {
                                 log::info!("extension attached: {event}");
                                 transport.send(&link.extension(&event, payload)).await?;
                             }
+
+                            // Confirmed first, then whatever the tail wrote
+                            // before there was anywhere to put it. Sent one at
+                            // a time and dropped only once each has gone, so a
+                            // socket that dies part way through leaves the rest
+                            // for the next session rather than eating it.
+                            if link.extension_attached(crate::extensions::LOGGING)
+                                && !self.pending_logs.is_empty()
+                            {
+                                log::info!(
+                                    "logging attached; sending {} lines held until it was",
+                                    self.pending_logs.len()
+                                );
+
+                                while let Some(line) = self.pending_logs.front() {
+                                    transport
+                                        .send(&link.extension("logging:send", line))
+                                        .await?;
+
+                                    self.pending_logs.sent();
+                                }
+                            }
                         }
 
                         Action::Extension(incoming) => {
@@ -494,12 +522,16 @@ impl Agent {
                 },
 
                 line = recv_log(&mut self.logs) => {
-                    // Only once the platform has attached logging. The tail runs
-                    // regardless so that a device does not lose the lines
-                    // written while it was negotiating, but sending before the
-                    // attach would be answering a question nobody asked.
+                    // Only once the platform has attached logging: sending
+                    // before the attach would be answering a question nobody
+                    // asked. The tail runs regardless, and what it writes in
+                    // the meantime waits in a bounded buffer to go out at the
+                    // attach, so a device does not lose the lines written while
+                    // it was negotiating.
                     if link.extension_attached(crate::extensions::LOGGING) {
                         transport.send(&link.extension("logging:send", line)).await?;
+                    } else {
+                        self.pending_logs.push(line);
                     }
                 }
 

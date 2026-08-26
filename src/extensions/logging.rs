@@ -15,6 +15,17 @@
 //! So the agent limits itself to the same rate and counts what it drops,
 //! reporting the count in a line of its own. A gap someone can see beats a gap
 //! they cannot.
+//!
+//! # Lines written before the platform is listening
+//!
+//! The tail starts with the process; the platform attaches logging a round
+//! trip or two into a session, and not at all if the product has it turned
+//! off. The lines written in between are worth having — they cover the boot,
+//! and whatever crash the device is reconnecting from — so they wait in
+//! [`Pending`] and go out in order once the attach lands. Bounded, and what
+//! the bound costs is reported the same way the rate limiter's losses are.
+
+use std::collections::VecDeque;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -82,14 +93,7 @@ pub fn spawn(config: &LoggingConfig) -> Result<mpsc::Receiver<Value>, Error> {
                 Allowed::Yes => {}
                 Allowed::No => continue,
                 Allowed::AfterDropping(dropped) => {
-                    let notice = json!({
-                        "level": "warning",
-                        "message": format!(
-                            "nerves-hub-link-agent dropped {dropped} log lines to stay under the \
-                             rate limit"
-                        ),
-                        "meta": { "time": now_micros() },
-                    });
+                    let notice = drop_notice(dropped, "to stay under the rate limit", now_micros());
 
                     if tx.send(notice).await.is_err() {
                         return;
@@ -173,6 +177,20 @@ fn plain_line(raw: &str) -> Value {
     })
 }
 
+/// A line saying what went missing, in the shape of a log line.
+///
+/// The count is the point of it: whatever was dropped, and wherever it was
+/// dropped, a gap someone can see beats a gap they cannot. `time` is the
+/// moment the gap opened rather than the moment the notice goes out, so the
+/// server orders it ahead of the lines that survived it.
+fn drop_notice(dropped: u64, why: &str, time: String) -> Value {
+    json!({
+        "level": "warning",
+        "message": format!("nerves-hub-link-agent dropped {dropped} log lines {why}"),
+        "meta": { "time": time },
+    })
+}
+
 fn now_micros() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,6 +262,95 @@ impl RateLimiter {
     }
 }
 
+/// How many lines wait for an attach.
+///
+/// Enough to cover a negotiation, including a slow one on a device that is
+/// talking while it boots. Small enough that a device the platform never
+/// attaches — logging turned off for the product — holds an unremarkable
+/// amount of memory forever.
+pub const PENDING_LINES: usize = 128;
+
+/// Lines the tail produced before the platform attached logging.
+///
+/// The alternative to holding them is throwing them away, and the lines
+/// written before an attach are not the boring ones: they are the boot, and
+/// the crash that caused the reconnect the attach is part of.
+///
+/// The bound is what makes that safe. A device whose platform never attaches
+/// keeps tailing regardless, so past the cap the oldest go and the count is
+/// reported when the rest are finally sent — the same bargain the rate limiter
+/// makes.
+pub struct Pending {
+    /// Oldest first. Holds only real lines; the notice for what was dropped is
+    /// built on the way out, so that its count is whatever it ends up being.
+    lines: VecDeque<Value>,
+    capacity: usize,
+    dropped: u64,
+    /// When the first line was dropped, which is where the gap starts.
+    gap_opened: Option<String>,
+}
+
+impl Pending {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            // A zero-length buffer would drop every line and hold the notice
+            // saying so, which is a worse answer than the smallest real one.
+            capacity: capacity.max(1),
+            dropped: 0,
+            gap_opened: None,
+        }
+    }
+
+    pub fn push(&mut self, line: Value) {
+        self.lines.push_back(line);
+
+        while self.lines.len() > self.capacity {
+            self.lines.pop_front();
+            self.dropped += 1;
+            self.gap_opened.get_or_insert_with(now_micros);
+        }
+    }
+
+    /// The next thing to send, left where it is.
+    ///
+    /// Paired with [`Pending::sent`] rather than handing the line over
+    /// outright. A flush is a run of sends that can fail half way through —
+    /// the socket dying is one of the reasons a backlog exists at all — and a
+    /// line taken out of here and then not sent is exactly the loss this
+    /// buffer is for. What did not go waits for the next session.
+    pub fn front(&self) -> Option<Value> {
+        match self.dropped {
+            0 => self.lines.front().cloned(),
+            dropped => Some(drop_notice(
+                dropped,
+                "while waiting for the platform to attach logging",
+                self.gap_opened.clone().unwrap_or_else(now_micros),
+            )),
+        }
+    }
+
+    /// Forget what [`Pending::front`] returned, now that it has gone.
+    pub fn sent(&mut self) {
+        if self.dropped > 0 {
+            self.dropped = 0;
+            self.gap_opened = None;
+            return;
+        }
+
+        self.lines.pop_front();
+    }
+
+    /// How many sends it would take to empty this, notice included.
+    pub fn len(&self) -> usize {
+        self.lines.len() + usize::from(self.dropped > 0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +403,73 @@ mod tests {
         assert_eq!(priority_to_level(Some(&json!("4"))), "warning");
         assert_eq!(priority_to_level(Some(&json!("7"))), "debug");
         assert_eq!(priority_to_level(None), "info");
+    }
+
+    #[test]
+    fn lines_written_before_an_attach_are_kept_in_order() {
+        let mut pending = Pending::new(8);
+
+        for message in ["one", "two", "three"] {
+            pending.push(plain_line(message));
+        }
+
+        assert_eq!(pending.len(), 3);
+        assert_eq!(drain(&mut pending), ["one", "two", "three"]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_full_buffer_loses_the_oldest_lines_and_says_how_many() {
+        let mut pending = Pending::new(2);
+
+        for message in ["one", "two", "three", "four"] {
+            pending.push(plain_line(message));
+        }
+
+        let sent = drain(&mut pending);
+
+        // The notice first: the gap is before the lines that survived it, and
+        // it carries the time the first line was dropped so the server orders
+        // it there too.
+        assert_eq!(
+            sent,
+            [
+                "nerves-hub-link-agent dropped 2 log lines while waiting for the platform to \
+                 attach logging",
+                "three",
+                "four",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_that_was_not_sent_waits_for_the_next_session() {
+        // The socket dying part way through a flush is one of the reasons
+        // there is a backlog at all, so it must not be how the backlog is
+        // lost.
+        let mut pending = Pending::new(8);
+
+        pending.push(plain_line("one"));
+        pending.push(plain_line("two"));
+
+        assert_eq!(pending.front().unwrap()["message"], "one");
+        assert_eq!(pending.front().unwrap()["message"], "one");
+
+        pending.sent();
+
+        assert_eq!(drain(&mut pending), ["two"]);
+    }
+
+    /// Every line the buffer would send, in order, as its message text.
+    fn drain(pending: &mut Pending) -> Vec<String> {
+        let mut sent = Vec::new();
+
+        while let Some(line) = pending.front() {
+            sent.push(line["message"].as_str().expect("a message").to_string());
+            pending.sent();
+        }
+
+        sent
     }
 
     #[test]
