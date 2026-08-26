@@ -49,6 +49,7 @@ enum Seen {
     Progress(usize),
     Dropped(usize),
     Rebooting(usize),
+    Status(usize, String),
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -58,7 +59,7 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
 
     let (firmware_url, _http) = serve_file(&firmware).await;
     let (events, mut seen) = mpsc::unbounded_channel();
-    let ws_port = fake_nerveshub(firmware_url, events).await;
+    let ws_port = fake_nerveshub(firmware_url, events, true).await;
 
     let config = config(&work, ws_port);
     let tool = Tool::build(&config.update_tool).expect("sandbox tool");
@@ -149,7 +150,11 @@ fn position(log: &[Seen], event: &Seen) -> Option<usize> {
 /// Connection 1 offers the update and drops as soon as the device reports
 /// progress. Every connection after that behaves: it accepts the join and says
 /// there is nothing to do, which is what a reconnecting device should find.
-async fn fake_nerveshub(firmware_url: String, events: UnboundedSender<Seen>) -> u16 {
+async fn fake_nerveshub(
+    firmware_url: String,
+    events: UnboundedSender<Seen>,
+    hang_up_on_progress: bool,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -161,6 +166,7 @@ async fn fake_nerveshub(firmware_url: String, events: UnboundedSender<Seen>) -> 
 
             let events = events.clone();
             let firmware_url = firmware_url.clone();
+            let hang_up_on_progress = hang_up_on_progress;
 
             tokio::spawn(async move {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -201,10 +207,21 @@ async fn fake_nerveshub(firmware_url: String, events: UnboundedSender<Seen>) -> 
                             // progress rather than sleeping means the install is
                             // provably underway when the socket goes, on a slow
                             // machine as well as a fast one.
-                            if connection == 1 {
+                            if hang_up_on_progress && connection == 1 {
                                 let _ = events.send(Seen::Dropped(connection));
                                 return;
                             }
+                        }
+
+                        event::STATUS_UPDATE => {
+                            let status = message
+                                .payload
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let _ = events.send(Seen::Status(connection, status));
                         }
 
                         event::REBOOTING => {
@@ -338,4 +355,71 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(dir.join("sandbox")).unwrap();
 
     dir
+}
+
+/// A successful install has to say so.
+///
+/// NervesHub opens an inflight update when the device reports `started` and
+/// closes it when the device reports `completed`. The failure path always
+/// reported itself; success went straight to the reboot, so an update that
+/// worked looked from the server exactly like one that stalled at 100%.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_install_reports_started_and_completed() {
+    let work = scratch("reports-status");
+    let firmware = write_firmware(&work);
+
+    let (firmware_url, _http) = serve_file(&firmware).await;
+    let (events, mut seen) = mpsc::unbounded_channel();
+    let ws_port = fake_nerveshub(firmware_url, events, false).await;
+
+    let config = config(&work, ws_port);
+    let tool = Tool::build(&config.update_tool).expect("sandbox tool");
+    let mut agent = Agent::new(config, "agent-test-02".into(), tool)
+        .await
+        .expect("agent");
+
+    let mut log = Vec::new();
+
+    tokio::select! {
+        outcome = agent.run() => panic!("the agent stopped: {outcome:?}"),
+
+        collected = tokio::time::timeout(PATIENCE, collect_until_reboot(&mut seen, &mut log)) => {
+            if collected.is_err() {
+                panic!("no reboot report within {PATIENCE:?}; got as far as {log:?}");
+            }
+        }
+    }
+
+    let started = position(&log, &Seen::Status(1, "started".into()))
+        .unwrap_or_else(|| panic!("never reported the install starting: {log:?}"));
+
+    let completed = position(&log, &Seen::Status(1, "completed".into()))
+        .unwrap_or_else(|| panic!("never reported the install completing: {log:?}"));
+
+    let rebooting = position(&log, &Seen::Rebooting(1))
+        .unwrap_or_else(|| panic!("never reported rebooting: {log:?}"));
+
+    assert!(
+        started < completed,
+        "reported completion before it reported starting: {log:?}"
+    );
+
+    // The ordering that matters. With `reboot.policy = "immediate"` the reboot
+    // is the last thing that happens, and a completion sent after it would
+    // never leave a real device.
+    assert!(
+        completed < rebooting,
+        "reported completion after the reboot, where it would not be sent: {log:?}"
+    );
+
+    // And the install it was reporting on actually happened.
+    let installed = work
+        .join("sandbox")
+        .join("22222222-2222-2222-2222-222222222222.fw");
+
+    assert!(
+        installed.exists(),
+        "reported completion without installing anything: {}",
+        installed.display()
+    );
 }
