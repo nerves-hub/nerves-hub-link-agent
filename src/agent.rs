@@ -317,7 +317,8 @@ impl Agent {
                             }
 
                             if let Some(update) = *update {
-                                self.on_update(&mut link, &mut transport, update).await?;
+                                self.on_update(&mut link, &mut transport, &mut heartbeat, update)
+                                    .await?;
                             }
                         }
 
@@ -344,7 +345,8 @@ impl Agent {
                         }
 
                         Action::ApplyUpdate(update) => {
-                            self.on_update(&mut link, &mut transport, *update).await?;
+                            self.on_update(&mut link, &mut transport, &mut heartbeat, *update)
+                                .await?;
                         }
 
                         Action::RunScript { reference, text } => {
@@ -510,6 +512,7 @@ impl Agent {
         &mut self,
         link: &mut Link,
         transport: &mut Transport,
+        heartbeat: &mut tokio::time::Interval,
         update: UpdatePayload,
     ) -> Result<(), Error> {
         let Some(meta) = update.firmware_meta.clone() else {
@@ -689,6 +692,20 @@ impl Agent {
                                 _ => {}
                             },
                         }
+                    }
+
+                    // The device socket's idle timeout is three minutes, and an
+                    // install can easily go quiet for longer -- progress on a
+                    // slow transfer arrives minutes apart. Without this the
+                    // server closes the connection partway through, which is
+                    // exactly what it did.
+                    //
+                    // Support scripts already run in their own task for this
+                    // reason: the loop owes the server a heartbeat well inside
+                    // whatever else it is doing. An install is the one slow
+                    // thing that was never given the same courtesy.
+                    _ = heartbeat.tick(), if connected => {
+                        transport.send(&link.heartbeat()).await?;
                     }
 
                     line = recv_log(logs), if connected => {
