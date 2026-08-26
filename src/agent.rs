@@ -155,7 +155,15 @@ impl Tool {
 pub struct Agent {
     config: Config,
     identifier: String,
-    tool: Tool,
+    /// `None` only while an install owns it.
+    ///
+    /// `Tool::install` needs `&mut Tool`, and an install runs as a task so that
+    /// it cannot hold up the session loop. A task cannot borrow from here, so
+    /// it takes the tool and hands it back when it finishes. Everything that
+    /// reaches for the tool has to cope with an install being in progress --
+    /// which is a true statement about the device, not an inconvenience of the
+    /// representation.
+    tool: Option<Tool>,
     ipc: Ipc,
     commands: mpsc::Receiver<Command>,
     http: crate::http::Client,
@@ -172,12 +180,30 @@ pub struct Agent {
     /// which case nothing is tailing anything.
     logs: Option<mpsc::Receiver<serde_json::Value>>,
     shell: Option<ShellSession>,
+    /// The install in flight, if there is one.
+    install: Option<InstallSession>,
+    /// What the device was running when the tool was last available.
+    ///
+    /// An install owns the tool, so `current_firmware` cannot be asked during
+    /// one. A reconnect mid-install still has to say what it is running, and
+    /// the answer has not changed -- the new firmware is going into the other
+    /// slot and is not running yet.
+    firmware: Option<FirmwareMeta>,
 }
 
 /// A running shell and the output still to be sent from it.
 struct ShellSession {
     shell: crate::extensions::local_shell::Shell,
     output: mpsc::Receiver<String>,
+}
+
+/// An install running as a task, and the two things the session loop needs
+/// from it: progress as it happens, and the tool back when it is done.
+struct InstallSession {
+    firmware: FirmwareMeta,
+    progress: mpsc::UnboundedReceiver<(Stage, u8)>,
+    #[allow(clippy::type_complexity)]
+    task: tokio::task::JoinHandle<(Tool, Result<crate::update_tool::Installed, Error>)>,
 }
 
 impl Agent {
@@ -223,10 +249,12 @@ impl Agent {
         let geo = Geo::new(config.extensions.geo.source.clone());
         let network_identity = NetworkIdentity::new(&config.extensions.network_identity);
 
+        let firmware = tool.current_firmware().ok();
+
         Ok(Self {
             config,
             identifier,
-            tool,
+            tool: Some(tool),
             ipc,
             commands,
             http,
@@ -236,6 +264,16 @@ impl Agent {
             script_results: mpsc::channel(8),
             logs,
             shell: None,
+            install: None,
+            firmware,
+        })
+    }
+
+    /// The tool, when an install is not using it.
+    fn tool(&self) -> Result<&Tool, Error> {
+        self.tool.as_ref().ok_or_else(|| Error::UpdateTool {
+            tool: "agent",
+            message: "an install is in progress and holds the update tool".into(),
         })
     }
 
@@ -277,18 +315,31 @@ impl Agent {
         let mut transport = Transport::connect(&self.config, &self.identifier).await?;
         let mut link = Link::new(
             DEVICE_API_VERSION,
-            self.tool.name(),
+            self.tool()?.name(),
             &self.config.extensions,
         );
 
-        let firmware = self.tool.current_firmware()?;
+        // Cached rather than asked for, when an install has the tool. What
+        // the device is running has not changed: the new firmware is going
+        // into the other slot and is not running yet.
+        let firmware = match self.tool.as_ref() {
+            Some(tool) => {
+                let firmware = tool.current_firmware()?;
+                self.firmware = Some(firmware.clone());
+                firmware
+            }
+            None => self.firmware.clone().ok_or_else(|| Error::UpdateTool {
+                tool: "agent",
+                message: "an install holds the tool and no firmware was cached".into(),
+            })?,
+        };
 
         self.ipc
             .update_shared(|shared| shared.firmware = Some(firmware.clone()))
             .await;
 
         transport
-            .send(&link.join(&self.tool.join_params(&firmware)))
+            .send(&link.join(&self.tool()?.join_params(&firmware)))
             .await?;
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
@@ -317,7 +368,13 @@ impl Agent {
                             }
 
                             if let Some(update) = *update {
-                                self.on_update(&mut link, &mut transport, update).await?;
+                                if self.install.is_some() {
+                                    log::warn!(
+                                        "an update is already installing; ignoring the one offered at join"
+                                    );
+                                } else {
+                                    self.on_update(&mut link, &mut transport, update).await?;
+                                }
                             }
                         }
 
@@ -344,7 +401,15 @@ impl Agent {
                         }
 
                         Action::ApplyUpdate(update) => {
-                            self.on_update(&mut link, &mut transport, *update).await?;
+                            // One at a time: two installs would put two writers
+                            // on the same slot.
+                            if self.install.is_some() {
+                                log::warn!(
+                                    "an update is already installing; ignoring the new one"
+                                );
+                            } else {
+                                self.on_update(&mut link, &mut transport, *update).await?;
+                            }
                         }
 
                         Action::RunScript { reference, text } => {
@@ -352,8 +417,15 @@ impl Agent {
                         }
 
                         Action::Reboot => {
-                            let _ = transport.send(&link.rebooting()).await;
-                            self.reboot("an operator asked").await;
+                            // Rebooting now would leave a half-written slot.
+                            if self.install.is_some() {
+                                log::warn!(
+                                    "asked to reboot mid-install; ignoring until it finishes"
+                                );
+                            } else {
+                                let _ = transport.send(&link.rebooting()).await;
+                                self.reboot("an operator asked").await;
+                            }
                         }
 
                         Action::Identify => {
@@ -369,6 +441,40 @@ impl Agent {
                 _ = heartbeat.tick() => {
                     transport.send(&link.heartbeat()).await?;
                 }
+
+                // An install reports through the session loop like anything
+                // else, so a slow one cannot starve heartbeats, logs, the
+                // shell or the IPC.
+                // One arm, not two: `select!` holds every arm's future at once,
+                // and two of them borrowing `self.install` is two mutable
+                // borrows of the same field.
+                event = next_install_event(&mut self.install) => match event {
+                    InstallEvent::Progress { uuid, stage, percent } => {
+                        forward_progress(
+                            &mut link, &mut transport, &self.ipc, &uuid, stage, percent,
+                        )
+                        .await?;
+                    }
+
+                    InstallEvent::Finished(outcome) => match *outcome {
+                        Ok((tool, result)) => {
+                            self.on_install_finished(&mut link, &mut transport, tool, result)
+                                .await?;
+                        }
+
+                        // The task itself failed -- panicked, or was aborted.
+                        // The tool went with it, so there is nothing to put
+                        // back and no way to say what this device runs. Ending
+                        // the session starts again from a known state.
+                        Err(e) => {
+                            self.install = None;
+                            return Err(Error::UpdateTool {
+                                tool: "agent",
+                                message: format!("the install task did not finish: {e}"),
+                            });
+                        }
+                    },
+                },
 
                 line = recv_log(&mut self.logs) => {
                     // Only once the platform has attached logging. The tail runs
@@ -395,7 +501,13 @@ impl Agent {
                 command = self.commands.recv() => {
                     match command {
                         Some(Command::MarkValid(reply)) => {
-                            let result = self.tool.mark_valid().map_err(|e| e.to_string());
+                            let result = match self.tool.as_mut() {
+                                Some(tool) => tool.mark_valid().map_err(|e| e.to_string()),
+                                // Marking a boot good while an install is
+                                // writing the other slot is not something to
+                                // guess at.
+                                None => Err("an install is in progress".to_string()),
+                            };
 
                             if result.is_ok() {
                                 let _ = transport.send(&link.firmware_validated()).await;
@@ -571,125 +683,62 @@ impl Agent {
             percent: 0,
         });
 
+        // The install runs as a task.
+        //
+        // It used to run in a loop of its own here, which meant the session
+        // loop stopped for the duration and every arm it serves had to be
+        // duplicated -- badly, as it turned out. A task cannot borrow from
+        // `self`, so it takes the tool and hands it back when it finishes, and
+        // the session loop carries on exactly as it does when idle.
+        let Some(mut tool) = self.tool.take() else {
+            // Guarded by the caller, so this is a bug rather than a race.
+            log::error!("asked to install while an install is already running");
+            return Ok(());
+        };
+
         // The installer's callback is synchronous and everything that reports
-        // progress is async, so the callback hands each report to the loop
-        // through an unbounded channel — whose `send` is not a future — and the
+        // progress is async, so the callback hands each report out through an
+        // unbounded channel -- whose `send` is not a future -- and the session
         // loop forwards it while the install is still running.
         //
         // An earlier version pushed into a `Mutex<Vec>` and drained it after
         // the install returned. That compiles and reports nothing useful: every
         // percentage arrives at once, after the thing it describes has already
-        // finished. A progress bar that fills in after the work is a progress
-        // bar nobody needs.
-        let (reports, mut incoming) = mpsc::unbounded_channel::<(Stage, u8)>();
+        // finished.
+        let (reports, progress) = mpsc::unbounded_channel::<(Stage, u8)>();
+        let http = self.http.clone();
 
-        // Scoped so the field borrows end here: `settle_reboot` below needs
-        // `&mut self` again, and the install holds `&mut self.tool`.
-        let result = {
-            // Borrowed field by field so the install can hold `&mut self.tool`
-            // while the arm below still reaches `self.ipc`.
-            let Self {
-                tool,
-                http,
-                ipc,
-                logs,
-                shell,
-                config,
-                ..
-            } = self;
+        let task = tokio::spawn(async move {
+            let result = tool
+                .install(&update, &http, move |stage, percent| {
+                    let _ = reports.send((stage, percent));
+                })
+                .await;
 
-            let install = tool.install(&update, http, move |stage, percent| {
-                let _ = reports.send((stage, percent));
-            });
+            // The tool goes back whatever happened. Losing it on a failed
+            // install would leave the agent unable to say what it is running.
+            (tool, result)
+        });
 
-            tokio::pin!(install);
+        self.install = Some(InstallSession {
+            firmware: meta,
+            progress,
+            task,
+        });
 
-            // Everything the session loop serves, served here too.
-            //
-            // An install used to be the only thing this loop attended to, which
-            // meant a device stopped answering for the whole of one: no logs, no
-            // shell, nothing but a percentage. That is precisely backwards. An
-            // update is when a device is most likely to be doing something
-            // unexpected, and it is the moment someone most wants to look at it.
-            let outcome = loop {
-                tokio::select! {
-                    // Biased so a report queued in the same tick as the install
-                    // finishing is still forwarded, rather than racing the
-                    // drain below for it.
-                    biased;
+        Ok(())
+    }
 
-                    Some((stage, percent)) = incoming.recv() => {
-                        forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
-                            .await?;
-                    }
-
-                    message = transport.recv() => {
-                        match message? {
-                            // The socket went away mid-install. The install
-                            // itself keeps running -- it is rauc or fwup writing
-                            // to a slot, and interrupting that is worse than
-                            // finishing it -- but this session is over.
-                            None => break Err(Error::Connection(
-                                "connection closed during install".into(),
-                            )),
-
-                            Some(message) => match link.handle(&message) {
-                                Action::Extension(incoming) => {
-                                    serve_shell(
-                                        shell,
-                                        &config.extensions.local_shell,
-                                        link,
-                                        transport,
-                                        incoming,
-                                    )
-                                    .await?;
-                                }
-
-                                // One at a time. Starting a second install over
-                                // a running one would have two writers on the
-                                // same slot.
-                                Action::ApplyUpdate(_) => log::warn!(
-                                    "an update is already installing; ignoring the new one"
-                                ),
-
-                                // Rebooting now would leave a half-written slot.
-                                Action::Reboot => log::warn!(
-                                    "asked to reboot mid-install; ignoring until it finishes"
-                                ),
-
-                                _ => {}
-                            },
-                        }
-                    }
-
-                    line = recv_log(logs) => {
-                        if link.extension_attached(crate::extensions::LOGGING) {
-                            transport.send(&link.extension("logging:send", line)).await?;
-                        }
-                    }
-
-                    output = recv_shell(shell) => {
-                        transport
-                            .send(&link.extension(
-                                "local_shell:shell_output",
-                                json!({ "data": output }),
-                            ))
-                            .await?;
-                    }
-
-                    finished = &mut install => break finished,
-                }
-            };
-
-            // The sender is dropped with the closure when the install ends, so
-            // this terminates on whatever was still queued.
-            while let Some((stage, percent)) = incoming.recv().await {
-                forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
-                    .await?;
-            }
-
-            outcome
-        };
+    /// An install has finished. Put the tool back and act on the outcome.
+    async fn on_install_finished(
+        &mut self,
+        link: &mut Link,
+        transport: &mut Transport,
+        tool: Tool,
+        result: Result<crate::update_tool::Installed, Error>,
+    ) -> Result<(), Error> {
+        self.tool = Some(tool);
+        self.install = None;
 
         match result {
             Ok(installed) => {
@@ -719,9 +768,12 @@ impl Agent {
             Err(e) => {
                 log::error!("install failed: {e}");
 
-                transport
+                // Best effort: the local bookkeeping below matters more than a
+                // report that cannot be delivered, and the reconnect reports
+                // whatever the device is actually running.
+                let _ = transport
                     .send(&link.status("failed", Some(&e.to_string())))
-                    .await?;
+                    .await;
 
                 self.ipc.broadcast(Event::UpdateFailed {
                     reason: e.to_string(),
@@ -764,7 +816,11 @@ impl Agent {
 
         match decided.decision {
             RebootDecision::Reboot => {
-                transport.send(&link.rebooting()).await?;
+                // Best effort, like the operator-triggered reboot. The decision
+                // is made and the firmware is already in the slot; a socket
+                // that has gone away is not a reason to leave the device on the
+                // old one until someone power-cycles it.
+                let _ = transport.send(&link.rebooting()).await;
                 self.reboot(&format!("{:?}", decided.source)).await;
             }
 
@@ -863,6 +919,46 @@ async fn forward_progress(
 ///
 /// A branch that never completes keeps the select shape the same whether or not
 /// the extension is enabled, rather than duplicating the loop.
+/// Something an install has to say.
+enum InstallEvent {
+    Progress {
+        uuid: String,
+        stage: Stage,
+        percent: u8,
+    },
+    /// Boxed because the outcome carries the tool back, which makes it much
+    /// larger than a progress report -- and this enum is returned on every
+    /// percentage point.
+    #[allow(clippy::type_complexity)]
+    Finished(
+        Box<Result<(Tool, Result<crate::update_tool::Installed, Error>), tokio::task::JoinError>>,
+    ),
+}
+
+/// The next thing a running install has to say, or park when there is none.
+///
+/// Progress is biased ahead of completion so the reports queued in the same
+/// tick as the install finishing are forwarded rather than skipped. The
+/// progress channel closes when the task's closure is dropped, which disables
+/// that arm and lets completion through.
+async fn next_install_event(install: &mut Option<InstallSession>) -> InstallEvent {
+    let Some(session) = install else {
+        return std::future::pending().await;
+    };
+
+    let uuid = session.firmware.uuid_or_unknown().to_string();
+
+    tokio::select! {
+        biased;
+
+        Some((stage, percent)) = session.progress.recv() => {
+            InstallEvent::Progress { uuid, stage, percent }
+        }
+
+        finished = &mut session.task => InstallEvent::Finished(Box::new(finished)),
+    }
+}
+
 async fn recv_log(logs: &mut Option<mpsc::Receiver<serde_json::Value>>) -> serde_json::Value {
     match logs {
         Some(rx) => match rx.recv().await {
