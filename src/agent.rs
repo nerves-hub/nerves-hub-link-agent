@@ -189,6 +189,18 @@ pub struct Agent {
     /// the answer has not changed -- the new firmware is going into the other
     /// slot and is not running yet.
     firmware: Option<FirmwareMeta>,
+    /// The join the tool last asked for, for the same reason as `firmware`.
+    ///
+    /// `join_params` needs the tool for more than metadata -- fwup adds its own
+    /// version, RAUC adds its compatible string -- so a reconnect during an
+    /// install cannot build one. Without this cached, such a reconnect could
+    /// not join at all, and since the tool only comes back through a live
+    /// session, it could never join again: the agent would back off and retry
+    /// forever with the firmware sitting installed and unreported.
+    join_params: Option<Vec<(&'static str, serde_json::Value)>>,
+    /// Which tool this is. Static for the life of the process, and needed on
+    /// every join, including the ones an install is holding the tool through.
+    tool_name: &'static str,
 }
 
 /// A running shell and the output still to be sent from it.
@@ -250,6 +262,8 @@ impl Agent {
         let network_identity = NetworkIdentity::new(&config.extensions.network_identity);
 
         let firmware = tool.current_firmware().ok();
+        let join_params = firmware.as_ref().map(|f| tool.join_params(f));
+        let tool_name = tool.name();
 
         Ok(Self {
             config,
@@ -266,14 +280,8 @@ impl Agent {
             shell: None,
             install: None,
             firmware,
-        })
-    }
-
-    /// The tool, when an install is not using it.
-    fn tool(&self) -> Result<&Tool, Error> {
-        self.tool.as_ref().ok_or_else(|| Error::UpdateTool {
-            tool: "agent",
-            message: "an install is in progress and holds the update tool".into(),
+            join_params,
+            tool_name,
         })
     }
 
@@ -313,34 +321,43 @@ impl Agent {
 
     async fn session(&mut self) -> Result<(), Error> {
         let mut transport = Transport::connect(&self.config, &self.identifier).await?;
-        let mut link = Link::new(
-            DEVICE_API_VERSION,
-            self.tool()?.name(),
-            &self.config.extensions,
-        );
+        let mut link = Link::new(DEVICE_API_VERSION, self.tool_name, &self.config.extensions);
 
-        // Cached rather than asked for, when an install has the tool. What
-        // the device is running has not changed: the new firmware is going
-        // into the other slot and is not running yet.
-        let firmware = match self.tool.as_ref() {
+        // Cached rather than asked for, when an install has the tool. What the
+        // device is running has not changed: the new firmware is going into the
+        // other slot and is not running yet.
+        //
+        // Nothing on this path may reach for the tool. A session that could not
+        // start without it would be unable to start during an install, and the
+        // tool only comes back through a session -- so the first mid-install
+        // disconnect would strand the agent for good.
+        let (firmware, join_params) = match self.tool.as_ref() {
             Some(tool) => {
                 let firmware = tool.current_firmware()?;
+                let join_params = tool.join_params(&firmware);
+
                 self.firmware = Some(firmware.clone());
-                firmware
+                self.join_params = Some(join_params.clone());
+
+                (firmware, join_params)
             }
-            None => self.firmware.clone().ok_or_else(|| Error::UpdateTool {
-                tool: "agent",
-                message: "an install holds the tool and no firmware was cached".into(),
-            })?,
+
+            None => {
+                let firmware = self.firmware.clone();
+                let join_params = self.join_params.clone();
+
+                firmware.zip(join_params).ok_or_else(|| Error::UpdateTool {
+                    tool: "agent",
+                    message: "an install holds the tool and no join was cached".into(),
+                })?
+            }
         };
 
         self.ipc
             .update_shared(|shared| shared.firmware = Some(firmware.clone()))
             .await;
 
-        transport
-            .send(&link.join(&self.tool()?.join_params(&firmware)))
-            .await?;
+        transport.send(&link.join(&join_params)).await?;
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
             self.config.server.heartbeat_interval_secs,
