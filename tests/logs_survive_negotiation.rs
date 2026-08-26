@@ -11,7 +11,9 @@
 //! join, then sits on the extensions join long enough that the agent has
 //! provably read its log lines with nowhere to send them. What has to be true
 //! afterwards is that all of them arrive once the attach lands, in the order
-//! they were written.
+//! they were written, and in one message rather than three -- the platform
+//! limits how often a device may send, so a backlog that went a line at a time
+//! would be dropped on the other side instead of this one.
 
 // `Tool::Sandbox` only exists when the feature does.
 #![cfg(feature = "sandbox")]
@@ -47,7 +49,8 @@ const PATIENCE: Duration = Duration::from_secs(30);
 enum Seen {
     Joined,
     LoggingAttached,
-    Log(String),
+    /// One `logging:send`, and the lines it carried.
+    Logs(Vec<String>),
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -87,16 +90,29 @@ async fn lines_written_before_the_attach_are_not_lost() {
     // The point. Every line the tail wrote while the platform was making up
     // its mind arrived, in the order it was written, once there was somewhere
     // to put it. Dropping them instead leaves this list empty.
-    let shipped: Vec<String> = log
+    let messages: Vec<&Vec<String>> = log
         .iter()
         .skip(attached)
         .filter_map(|entry| match entry {
-            Seen::Log(message) => Some(message.clone()),
+            Seen::Logs(lines) => Some(lines),
             _ => None,
         })
         .collect();
 
+    let shipped: Vec<String> = messages
+        .iter()
+        .flat_map(|lines| lines.iter().cloned())
+        .collect();
+
     assert_eq!(shipped, LINES, "the held lines did not arrive: {log:?}");
+
+    // And in one message. Three would be three times the rate limit's cost for
+    // the same second of logs, which is the thing batching exists to stop.
+    assert_eq!(
+        messages.len(),
+        1,
+        "the backlog went out a line at a time: {log:?}"
+    );
 }
 
 /// Drain events until every line has been seen, keeping them in order.
@@ -104,13 +120,13 @@ async fn collect_lines(seen: &mut UnboundedReceiver<Seen>, log: &mut Vec<Seen>) 
     let mut lines = 0;
 
     while let Some(event) = seen.recv().await {
-        if matches!(event, Seen::Log(_)) {
-            lines += 1;
+        if let Seen::Logs(sent) = &event {
+            lines += sent.len();
         }
 
         log.push(event);
 
-        if lines == LINES.len() {
+        if lines >= LINES.len() {
             return;
         }
     }
@@ -166,12 +182,19 @@ async fn fake_nerveshub(events: UnboundedSender<Seen>) -> u16 {
                         }
 
                         "logging:send" => {
-                            let message = message.payload["message"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
+                            let lines = message.payload["lines"]
+                                .as_array()
+                                .map(|lines| {
+                                    lines
+                                        .iter()
+                                        .map(|line| {
+                                            line["message"].as_str().unwrap_or_default().to_string()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
 
-                            let _ = events.send(Seen::Log(message));
+                            let _ = events.send(Seen::Logs(lines));
                         }
 
                         _ => {}
@@ -225,9 +248,9 @@ enabled = true
 # Three lines and then nothing, so the tail stays alive without writing
 # anything the assertions have to account for.
 source = {{ command = "{source}" }}
-# Well above what this test sends: the rate limiter has its own tests, and a
-# limit that bit here would look like the loss this one is about.
-max_lines_per_second = 100
+# Well above what this test sends: the cap has its own tests, and one that bit
+# here would look like the loss this one is about.
+max_lines_per_batch = 100
 "#,
         work_dir = work.join("sandbox").display(),
         ipc = work.join("agent.sock").display(),

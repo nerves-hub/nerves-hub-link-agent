@@ -12,9 +12,16 @@
 //! serve and the version of each:
 //!
 //! ```text
-//! -> phx_join "extensions"  {"health": "0.0.1", "geo": "0.0.1"}
+//! -> phx_join "extensions"  {"health": "0.0.1", "logging": "0.1.0"}
 //! <- phx_reply              ["health"]
 //! ```
+//!
+//! The version is a capability check as much as a version, and one that only
+//! goes one way: the device names a single version per extension and the
+//! platform takes it or leaves it. There is nothing in the reply to negotiate
+//! with -- it is a list of keys -- so `logging` at 0.1.0 means a NervesHub
+//! that has only the 0.0.1 extension does not attach it at all. Which the
+//! device can see and report, unlike lines dropped silently on the far side.
 //!
 //! The reply is the subset the *platform* wants attached, which is narrower
 //! than what the device offered: an extension can be turned off per product or
@@ -37,7 +44,7 @@
 //! <- geo:location:request        {}
 //! -> geo:location:update         {"latitude": .., "longitude": .., "source": ".."}
 //!
-//! -> logging:send                {"timestamp": .., "level": .., "message": ..}
+//! -> logging:send                {"lines": [{"level": .., "message": ..}, ..]}
 //!
 //! <- local_shell:request_shell   {}
 //! <- local_shell:shell_input     {"data": ".."}
@@ -70,13 +77,33 @@ pub const LOGGING: &str = "logging";
 pub const LOCAL_SHELL: &str = "local_shell";
 pub const NETWORK_IDENTITY: &str = "network_identity";
 
-/// The version this agent implements of every extension.
+/// The version this agent implements of most extensions.
 ///
-/// One number for all of them because they were introduced together and the
-/// server matches each with `~> 0.0.1`. Sending a version it cannot match gets
-/// the extension quietly dropped from the attach list rather than an error, so
+/// One number for them because they were introduced together and the server
+/// matches each with `~> 0.0.1`. Sending a version it cannot match gets the
+/// extension quietly dropped from the attach list rather than an error, so
 /// this is worth keeping honest.
 const VERSION: &str = "0.0.1";
+
+/// The logging extension, which is the one that has moved on.
+///
+/// 0.1.0 says this device puts many log lines in one `logging:send` rather
+/// than paying a message per line. The platform serves it with a different
+/// module than the 0.0.1 one, and picks between them by the version declared
+/// here -- so a NervesHub that has only the 0.0.1 extension matches
+/// `~> 0.0.1`, leaves logging out of the attach list, and the device is told
+/// rather than having its batches dropped somewhere it cannot see.
+const LOGGING_VERSION: &str = "0.1.0";
+
+/// What this agent implements of `key`.
+const fn version(key: &str) -> &'static str {
+    // `match` on a `&str` is not const, and this is a two-armed decision.
+    if matches!(key.as_bytes(), b"logging") {
+        LOGGING_VERSION
+    } else {
+        VERSION
+    }
+}
 
 /// Something the server asked the device to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -140,8 +167,11 @@ impl Extensions {
 
     /// The join payload: every offered extension and its version.
     pub fn join_payload(&self) -> Value {
-        let versions: BTreeMap<&str, &str> =
-            self.offered.iter().map(|key| (*key, VERSION)).collect();
+        let versions: BTreeMap<&str, &str> = self
+            .offered
+            .iter()
+            .map(|key| (*key, version(key)))
+            .collect();
 
         json!(versions)
     }
@@ -306,6 +336,22 @@ mod tests {
             extensions.handle("local_shell:request_shell", &json!({})),
             None
         );
+    }
+
+    #[test]
+    fn logging_declares_the_version_that_may_batch() {
+        // The version is how the platform decides whether this device may send
+        // many lines in one message. A NervesHub that predates batching does
+        // not match 0.2.0 and leaves logging unattached, which is the point:
+        // the agent finds out rather than sending into the dark.
+        let mut config = Config::default();
+        config.logging.enabled = true;
+        config.health.enabled = true;
+
+        let payload = Extensions::new(&config).join_payload();
+
+        assert_eq!(payload["logging"], "0.1.0");
+        assert_eq!(payload["health"], "0.0.1");
     }
 
     #[test]
