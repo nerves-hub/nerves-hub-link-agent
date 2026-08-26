@@ -611,6 +611,11 @@ impl Agent {
             // shell, nothing but a percentage. That is precisely backwards. An
             // update is when a device is most likely to be doing something
             // unexpected, and it is the moment someone most wants to look at it.
+            // Whether the socket is still there. An install carries on without
+            // it: `rauc` is writing to a slot, and the useful thing to do when
+            // the connection drops is finish, reboot, and report afterwards.
+            let mut connected = true;
+
             let outcome = loop {
                 tokio::select! {
                     // Biased so a report queued in the same tick as the install
@@ -618,20 +623,44 @@ impl Agent {
                     // drain below for it.
                     biased;
 
+                    // Drained whether or not it can be sent on: leaving reports
+                    // queued would stall the installer's callback behind a
+                    // channel nobody is reading.
                     Some((stage, percent)) = incoming.recv() => {
-                        forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
+                        if connected {
+                            forward_progress(
+                                link, transport, ipc, meta.uuid_or_unknown(), stage, percent,
+                            )
                             .await?;
+                        }
                     }
 
-                    message = transport.recv() => {
-                        match message? {
-                            // The socket went away mid-install. The install
-                            // itself keeps running -- it is rauc or fwup writing
-                            // to a slot, and interrupting that is worse than
-                            // finishing it -- but this session is over.
-                            None => break Err(Error::Connection(
-                                "connection closed during install".into(),
-                            )),
+                    message = transport.recv(), if connected => {
+                        let received = match message {
+                            Ok(received) => received,
+                            // A transport error is the socket going away by
+                            // another name.
+                            Err(e) => {
+                                log::warn!("connection lost during install ({e}); \
+                                            finishing the install anyway");
+                                connected = false;
+                                continue;
+                            }
+                        };
+
+                        match received {
+                            // The socket closed. Do not break: the install
+                            // future lives in this scope, and leaving the loop
+                            // drops it -- abandoning `rauc` mid-write and
+                            // leaving nothing to reboot the device afterwards.
+                            // Stop sending, keep supervising.
+                            None => {
+                                log::warn!(
+                                    "connection closed during install; finishing the install anyway"
+                                );
+                                connected = false;
+                                continue;
+                            }
 
                             Some(message) => match link.handle(&message) {
                                 Action::Extension(incoming) => {
@@ -662,13 +691,13 @@ impl Agent {
                         }
                     }
 
-                    line = recv_log(logs) => {
+                    line = recv_log(logs), if connected => {
                         if link.extension_attached(crate::extensions::LOGGING) {
                             transport.send(&link.extension("logging:send", line)).await?;
                         }
                     }
 
-                    output = recv_shell(shell) => {
+                    output = recv_shell(shell), if connected => {
                         transport
                             .send(&link.extension(
                                 "local_shell:shell_output",
@@ -681,11 +710,18 @@ impl Agent {
                 }
             };
 
-            // The sender is dropped with the closure when the install ends, so
-            // this terminates on whatever was still queued.
+            // Terminates because the install future has completed by now and
+            // its closure -- which owns the sender -- has been dropped with it.
+            //
+            // That is only true because the loop above always runs the install
+            // to completion. Leaving it early left this waiting on a sender
+            // that never closed, which hung the agent for as long as the
+            // process lived.
             while let Some((stage, percent)) = incoming.recv().await {
-                forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
-                    .await?;
+                if connected {
+                    forward_progress(link, transport, ipc, meta.uuid_or_unknown(), stage, percent)
+                        .await?;
+                }
             }
 
             outcome
@@ -719,9 +755,12 @@ impl Agent {
             Err(e) => {
                 log::error!("install failed: {e}");
 
-                transport
+                // Best effort for the same reason: the local bookkeeping below
+                // matters more than a report that cannot be delivered, and the
+                // reconnect reports the firmware it is actually running.
+                let _ = transport
                     .send(&link.status("failed", Some(&e.to_string())))
-                    .await?;
+                    .await;
 
                 self.ipc.broadcast(Event::UpdateFailed {
                     reason: e.to_string(),
@@ -764,7 +803,11 @@ impl Agent {
 
         match decided.decision {
             RebootDecision::Reboot => {
-                transport.send(&link.rebooting()).await?;
+                // Best effort, like the operator-triggered reboot above. The
+                // decision has been made and the new firmware is in the slot;
+                // a socket that has gone away is not a reason to leave the
+                // device sitting on the old one until someone power-cycles it.
+                let _ = transport.send(&link.rebooting()).await;
                 self.reboot(&format!("{:?}", decided.source)).await;
             }
 
