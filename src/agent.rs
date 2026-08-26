@@ -700,6 +700,16 @@ impl Agent {
             percent: 0,
         });
 
+        // NervesHub is told an update started, and later that it finished. It
+        // has a clause for each -- `started` carries its own telemetry, and the
+        // inflight update stays open until something closes it.
+        //
+        // Best effort, like every other report during an install. The install
+        // is going to happen whether or not the socket is there to hear about
+        // it, and a device that refused to update because it could not say so
+        // would be worse off than one that updates quietly.
+        let _ = transport.send(&link.status("started", None)).await;
+
         // The install runs as a task.
         //
         // It used to run in a loop of its own here, which meant the session
@@ -775,6 +785,17 @@ impl Agent {
                         s.pending_validation = true;
                     })
                     .await;
+
+                // Before the reboot, not after: with `reboot.policy =
+                // "immediate"` `settle_reboot` does not come back, and a
+                // completion sent afterwards would never leave the device.
+                //
+                // Without this NervesHub sees an update start, watches progress
+                // reach 100, and then nothing -- the inflight update stays open
+                // until the device reconnects on the new firmware, which is a
+                // reboot away and reads as a stall in the meantime. The failure
+                // path has always reported itself; only success was silent.
+                let _ = transport.send(&link.status("completed", None)).await;
 
                 if installed.reboot_required {
                     self.settle_reboot(link, transport, &installed.firmware)
