@@ -200,10 +200,13 @@ source = { journald = {} }
 # Anything that writes lines to stdout, for a system without systemd:
 # source = { command = "tail -F /var/log/messages" }
 #
-# NervesHub rate limits log lines per device and silently drops the excess, so
-# the agent holds itself to the same rate and reports what it dropped in a line
-# of its own. A gap you can see beats one you cannot.
-max_lines_per_second = 5
+# NervesHub limits how often a device may send rather than how much it may say,
+# so the agent collects for a second and sends the lot as one message. This is
+# how many lines one of those may carry; the platform drops whatever a message
+# carries past its own cap, so raising this past 100 gains nothing. Lines that
+# do not fit wait for the next second, and lines the buffer cannot hold are
+# reported as dropped -- a gap you can see beats one you cannot.
+max_lines_per_batch = 100
 
 [extensions.local_shell]
 # Think before turning this on. Every other extension lets the platform read

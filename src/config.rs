@@ -192,14 +192,16 @@ pub struct LoggingConfig {
     pub enabled: bool,
     #[serde(default)]
     pub source: LoggingSource,
-    /// Lines per second the agent will send.
+    /// How many lines one message may carry.
     ///
-    /// NervesHub rate limits log lines per device and silently drops the
-    /// excess, so a device that sends faster than this loses lines without
-    /// being told. Matching the server's limit here means the dropping happens
-    /// where it can be logged instead.
-    #[serde(default = "default_log_rate")]
-    pub max_lines_per_second: u32,
+    /// The agent collects for a second and sends the lot as one `logging:send`,
+    /// because NervesHub limits how often a device may send rather than how
+    /// much it may say. The platform drops whatever a message carries past its
+    /// own cap, so sending more than this gains nothing; lines that do not fit
+    /// wait for the next flush, and lines the buffer cannot hold are reported
+    /// as dropped.
+    #[serde(default = "default_max_lines_per_batch")]
+    pub max_lines_per_batch: usize,
 }
 
 impl Default for LoggingConfig {
@@ -207,7 +209,7 @@ impl Default for LoggingConfig {
         Self {
             enabled: false,
             source: LoggingSource::default(),
-            max_lines_per_second: default_log_rate(),
+            max_lines_per_batch: default_max_lines_per_batch(),
         }
     }
 }
@@ -710,8 +712,8 @@ fn default_script_timeout() -> u64 {
 fn default_script_output() -> usize {
     64 * 1024
 }
-fn default_log_rate() -> u32 {
-    5
+fn default_max_lines_per_batch() -> usize {
+    crate::extensions::logging::MAX_LINES_PER_BATCH
 }
 fn default_shell() -> String {
     "/bin/sh".into()

@@ -185,7 +185,7 @@ unprompted.
 | --- | --- |
 | **health** | Memory, CPU, load and temperature from `/proc` and `/sys`. CPU is a delta between reports, so the first after a restart omits it rather than sending the since-boot average as though it were current. |
 | **geo** | A position, from `whenwhere` GeoIP, a fixed configured location, or a command for devices with a GPS. Nothing is sent when a lookup fails: a location the agent could not establish is not a location at the origin. |
-| **logging** | `journalctl --follow`, or any command that writes lines. Rate limited to match the server, which silently drops the excess. Under systemd the agent logs with systemd's `<N>` priority prefix and no timestamp of its own, so a line reaches NervesHub with one timestamp and its real level rather than two timestamps and `info`. |
+| **logging** | `journalctl --follow`, or any command that writes lines. Collected for a second and sent as one message, because NervesHub limits how often a device may send rather than how much it may say. Under systemd the agent logs with systemd's `<N>` priority prefix and no timestamp of its own, so a line reaches NervesHub with one timestamp and its real level rather than two timestamps and `info`. |
 | **local_shell** | A real pty running a shell, resizable, streamed to the browser terminal. |
 | **network_identity** | Iroh, Tailscale, NetBird or WireGuard keys, from configured commands. Asked for once on attach, never polled. |
 

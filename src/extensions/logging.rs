@@ -4,26 +4,29 @@
 //! question; this one runs a tail and pushes lines as they appear, which makes
 //! it the one that can flood the connection.
 //!
-//! # Rate limiting is not optional
+//! # One message a second, not one a line
 //!
-//! NervesHub rate limits log lines per device — a few per second with a small
-//! burst — and **silently drops** anything over. A device in a crash loop
-//! writing hundreds of lines a second would have almost all of them discarded
-//! server-side with nothing to say so, and the surviving lines would be an
-//! arbitrary sample of the interesting ones.
+//! NervesHub rate limits how often a device may send, not how much it may say:
+//! a few messages per second per device, and **silently dropped** past that.
+//! So the agent does not send a line when it has one. Lines go into
+//! [`Pending`], and once a second whatever is there goes out as a single
+//! `logging:send` carrying a `lines` array.
 //!
-//! So the agent limits itself to the same rate and counts what it drops,
-//! reporting the count in a line of its own. A gap someone can see beats a gap
-//! they cannot.
+//! That is what makes a crash loop reportable. A device writing hundreds of
+//! lines a second used to lose almost all of them to the limiter, and the
+//! survivors were an arbitrary sample of the interesting ones; now a second's
+//! worth arrives together, up to the batch cap.
 //!
-//! # Lines written before the platform is listening
+//! Sending a batch at all requires a platform that can read one, which is what
+//! the extension's `0.1.0` version declares. A NervesHub without that version
+//! of the extension does not attach logging at all for a device offering it,
+//! so there is no version of this where the agent sends batches into the dark.
 //!
-//! The tail starts with the process; the platform attaches logging a round
-//! trip or two into a session, and not at all if the product has it turned
-//! off. The lines written in between are worth having — they cover the boot,
-//! and whatever crash the device is reconnecting from — so they wait in
-//! [`Pending`] and go out in order once the attach lands. Bounded, and what
-//! the bound costs is reported the same way the rate limiter's losses are.
+//! # What the cap costs is reported
+//!
+//! [`Pending`] is bounded, and so is a batch. Whatever does not fit is
+//! dropped, oldest first, and the count goes out as a line of its own ahead of
+//! the survivors. A gap someone can see beats a gap they cannot.
 
 use std::collections::VecDeque;
 
@@ -56,7 +59,6 @@ pub fn spawn(config: &LoggingConfig) -> Result<mpsc::Receiver<Value>, Error> {
     };
 
     let journald = matches!(config.source, LoggingSource::Journald { .. });
-    let mut limiter = RateLimiter::new(config.max_lines_per_second);
 
     tokio::spawn(async move {
         let mut child = match tokio::process::Command::new("sh")
@@ -87,18 +89,6 @@ pub fn spawn(config: &LoggingConfig) -> Result<mpsc::Receiver<Value>, Error> {
 
             if line.trim().is_empty() {
                 continue;
-            }
-
-            match limiter.check() {
-                Allowed::Yes => {}
-                Allowed::No => continue,
-                Allowed::AfterDropping(dropped) => {
-                    let notice = drop_notice(dropped, "to stay under the rate limit", now_micros());
-
-                    if tx.send(notice).await.is_err() {
-                        return;
-                    }
-                }
             }
 
             let payload = if journald {
@@ -217,69 +207,39 @@ fn priority_to_level(priority: Option<&Value>) -> &'static str {
     }
 }
 
-enum Allowed {
-    Yes,
-    No,
-    /// Allowed, and this many were dropped since the last one that was.
-    AfterDropping(u64),
+/// How many lines one message may carry.
+///
+/// The platform's own cap. Anything past it is dropped server-side, so there
+/// is nothing to gain by sending more, and the drop notice this agent writes
+/// counts against it like any other line.
+pub const MAX_LINES_PER_BATCH: usize = 100;
+
+/// How long the agent collects before sending.
+pub const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many flushes' worth of lines wait at once.
+///
+/// A burst then drains over the next few seconds instead of being thrown away,
+/// while a device the platform never attaches -- logging turned off for the
+/// product -- holds a bounded and unremarkable amount of memory forever.
+pub const PENDING_BATCHES: usize = 5;
+
+/// How many lines wait for the next flush, for a given batch size.
+pub const fn pending_lines(max_lines_per_batch: usize) -> usize {
+    max_lines_per_batch.saturating_mul(PENDING_BATCHES)
 }
 
-/// A token bucket, matching the shape of the server's own limiter.
-struct RateLimiter {
-    per_second: u32,
-    window_started: std::time::Instant,
-    sent_this_window: u32,
-    dropped_since_last_send: u64,
-}
-
-impl RateLimiter {
-    fn new(per_second: u32) -> Self {
-        Self {
-            per_second,
-            window_started: std::time::Instant::now(),
-            sent_this_window: 0,
-            dropped_since_last_send: 0,
-        }
-    }
-
-    fn check(&mut self) -> Allowed {
-        if self.window_started.elapsed() >= std::time::Duration::from_secs(1) {
-            self.window_started = std::time::Instant::now();
-            self.sent_this_window = 0;
-        }
-
-        if self.sent_this_window >= self.per_second {
-            self.dropped_since_last_send += 1;
-            return Allowed::No;
-        }
-
-        self.sent_this_window += 1;
-
-        match std::mem::take(&mut self.dropped_since_last_send) {
-            0 => Allowed::Yes,
-            dropped => Allowed::AfterDropping(dropped),
-        }
-    }
-}
-
-/// How many lines wait for an attach.
+/// Lines waiting to be sent.
 ///
-/// Enough to cover a negotiation, including a slow one on a device that is
-/// talking while it boots. Small enough that a device the platform never
-/// attaches — logging turned off for the product — holds an unremarkable
-/// amount of memory forever.
-pub const PENDING_LINES: usize = 128;
-
-/// Lines the tail produced before the platform attached logging.
+/// Everything the tail produces lands here, whether or not the platform has
+/// attached logging yet. Holding them is the point: lines written before an
+/// attach are not the boring ones -- they are the boot, and the crash that
+/// caused the reconnect the attach is part of -- and lines written between
+/// flushes are how one message comes to carry a second's worth.
 ///
-/// The alternative to holding them is throwing them away, and the lines
-/// written before an attach are not the boring ones: they are the boot, and
-/// the crash that caused the reconnect the attach is part of.
-///
-/// The bound is what makes that safe. A device whose platform never attaches
-/// keeps tailing regardless, so past the cap the oldest go and the count is
-/// reported when the rest are finally sent — the same bargain the rate limiter
-/// makes.
+/// The bound is what makes that safe. The tail keeps running whatever the
+/// platform does, so past the cap the oldest go and the count is reported with
+/// the rest.
 pub struct Pending {
     /// Oldest first. Holds only real lines; the notice for what was dropped is
     /// built on the way out, so that its count is whatever it ends up being.
@@ -312,36 +272,58 @@ impl Pending {
         }
     }
 
-    /// The next thing to send, left where it is.
+    /// The next message's worth, left where it is.
     ///
-    /// Paired with [`Pending::sent`] rather than handing the line over
-    /// outright. A flush is a run of sends that can fail half way through —
-    /// the socket dying is one of the reasons a backlog exists at all — and a
-    /// line taken out of here and then not sent is exactly the loss this
-    /// buffer is for. What did not go waits for the next session.
-    pub fn front(&self) -> Option<Value> {
-        match self.dropped {
-            0 => self.lines.front().cloned(),
-            dropped => Some(drop_notice(
-                dropped,
-                "while waiting for the platform to attach logging",
+    /// Oldest first, at most `max` of them, the drop notice ahead of the
+    /// survivors it accounts for and counted against `max` like any other
+    /// line -- the platform caps what one message may carry, and a notice that
+    /// pushed the batch over the cap would be dropped by the very rule it
+    /// exists to report.
+    ///
+    /// Paired with [`Pending::sent`] rather than handing the lines over
+    /// outright. A send can fail -- the socket dying is one of the reasons a
+    /// backlog exists at all -- and lines taken out of here and then not sent
+    /// are exactly the loss this buffer is for. What did not go waits for the
+    /// next flush.
+    pub fn batch(&self, max: usize) -> Vec<Value> {
+        let mut batch = Vec::with_capacity(max.min(self.len()));
+
+        if self.dropped > 0 {
+            batch.push(drop_notice(
+                self.dropped,
+                "to stay inside its buffer",
                 self.gap_opened.clone().unwrap_or_else(now_micros),
-            )),
+            ));
         }
+
+        batch.extend(
+            self.lines
+                .iter()
+                .take(max.saturating_sub(batch.len()))
+                .cloned(),
+        );
+        batch.truncate(max);
+
+        batch
     }
 
-    /// Forget what [`Pending::front`] returned, now that it has gone.
-    pub fn sent(&mut self) {
-        if self.dropped > 0 {
+    /// Forget the first `count` of what [`Pending::batch`] returned, now that
+    /// it has gone.
+    pub fn sent(&mut self, count: usize) {
+        let mut count = count;
+
+        if self.dropped > 0 && count > 0 {
             self.dropped = 0;
             self.gap_opened = None;
-            return;
+            count -= 1;
         }
 
-        self.lines.pop_front();
+        for _ in 0..count {
+            let _ = self.lines.pop_front();
+        }
     }
 
-    /// How many sends it would take to empty this, notice included.
+    /// How many lines are waiting, the drop notice included.
     pub fn len(&self) -> usize {
         self.lines.len() + usize::from(self.dropped > 0)
     }
@@ -349,6 +331,15 @@ impl Pending {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// The payload of a `logging:send`.
+///
+/// An object with one array in it rather than a bare array: Phoenix payloads
+/// are maps everywhere else in this protocol, and a key leaves room for
+/// whatever a later version of the extension wants to say alongside the lines.
+pub fn batch_payload(lines: Vec<Value>) -> Value {
+    json!({ "lines": lines })
 }
 
 #[cfg(test)]
@@ -406,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn lines_written_before_an_attach_are_kept_in_order() {
+    fn a_flush_carries_everything_waiting_in_the_order_it_was_written() {
         let mut pending = Pending::new(8);
 
         for message in ["one", "two", "three"] {
@@ -414,8 +405,32 @@ mod tests {
         }
 
         assert_eq!(pending.len(), 3);
-        assert_eq!(drain(&mut pending), ["one", "two", "three"]);
+
+        let batch = pending.batch(MAX_LINES_PER_BATCH);
+
+        assert_eq!(messages(&batch), ["one", "two", "three"]);
+
+        pending.sent(batch.len());
+
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_batch_stops_at_the_cap_and_the_rest_goes_next_time() {
+        // The platform drops whatever a message carries past its cap, so this
+        // is the one place the agent may not simply send what it has.
+        let mut pending = Pending::new(100);
+
+        for line in 1..=5 {
+            pending.push(plain_line(&format!("line {line}")));
+        }
+
+        let batch = pending.batch(2);
+        assert_eq!(messages(&batch), ["line 1", "line 2"]);
+
+        pending.sent(batch.len());
+
+        assert_eq!(messages(&pending.batch(2)), ["line 3", "line 4"]);
     }
 
     #[test]
@@ -426,16 +441,13 @@ mod tests {
             pending.push(plain_line(message));
         }
 
-        let sent = drain(&mut pending);
-
         // The notice first: the gap is before the lines that survived it, and
         // it carries the time the first line was dropped so the server orders
         // it there too.
         assert_eq!(
-            sent,
+            messages(&pending.batch(MAX_LINES_PER_BATCH)),
             [
-                "nerves-hub-link-agent dropped 2 log lines while waiting for the platform to \
-                 attach logging",
+                "nerves-hub-link-agent dropped 2 log lines to stay inside its buffer",
                 "three",
                 "four",
             ]
@@ -443,49 +455,56 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_was_not_sent_waits_for_the_next_session() {
-        // The socket dying part way through a flush is one of the reasons
-        // there is a backlog at all, so it must not be how the backlog is
-        // lost.
+    fn the_drop_notice_counts_against_the_cap_like_any_other_line() {
+        // Otherwise the line reporting the gap is the one the platform drops
+        // for making the message too long, which would hide exactly what it
+        // exists to show.
+        let mut pending = Pending::new(2);
+
+        for message in ["one", "two", "three"] {
+            pending.push(plain_line(message));
+        }
+
+        let batch = pending.batch(2);
+
+        assert_eq!(batch.len(), 2);
+        assert!(batch[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dropped 1 log lines"));
+        assert_eq!(batch[1]["message"], "two");
+    }
+
+    #[test]
+    fn lines_that_were_not_sent_wait_for_the_next_flush() {
+        // The socket dying part way through is one of the reasons there is a
+        // backlog at all, so it must not be how the backlog is lost.
         let mut pending = Pending::new(8);
 
         pending.push(plain_line("one"));
         pending.push(plain_line("two"));
 
-        assert_eq!(pending.front().unwrap()["message"], "one");
-        assert_eq!(pending.front().unwrap()["message"], "one");
+        assert_eq!(messages(&pending.batch(8)), ["one", "two"]);
+        assert_eq!(messages(&pending.batch(8)), ["one", "two"]);
 
-        pending.sent();
+        pending.sent(1);
 
-        assert_eq!(drain(&mut pending), ["two"]);
-    }
-
-    /// Every line the buffer would send, in order, as its message text.
-    fn drain(pending: &mut Pending) -> Vec<String> {
-        let mut sent = Vec::new();
-
-        while let Some(line) = pending.front() {
-            sent.push(line["message"].as_str().expect("a message").to_string());
-            pending.sent();
-        }
-
-        sent
+        assert_eq!(messages(&pending.batch(8)), ["two"]);
     }
 
     #[test]
-    fn the_limiter_reports_what_it_dropped_rather_than_hiding_it() {
-        let mut limiter = RateLimiter::new(2);
+    fn the_payload_is_an_object_holding_the_lines() {
+        let payload = batch_payload(vec![plain_line("one")]);
 
-        assert!(matches!(limiter.check(), Allowed::Yes));
-        assert!(matches!(limiter.check(), Allowed::Yes));
-        assert!(matches!(limiter.check(), Allowed::No));
-        assert!(matches!(limiter.check(), Allowed::No));
+        assert_eq!(payload["lines"][0]["message"], "one");
+        assert_eq!(payload["lines"].as_array().unwrap().len(), 1);
+    }
 
-        limiter.window_started = std::time::Instant::now() - std::time::Duration::from_secs(2);
-
-        match limiter.check() {
-            Allowed::AfterDropping(2) => {}
-            other => panic!("expected 2 dropped, got {}", matches!(other, Allowed::Yes)),
-        }
+    /// The message text of each line, in order.
+    fn messages(lines: &[Value]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line["message"].as_str().expect("a message").to_string())
+            .collect()
     }
 }

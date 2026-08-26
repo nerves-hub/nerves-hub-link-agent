@@ -179,10 +179,13 @@ pub struct Agent {
     /// Log lines waiting to be shipped. `None` when the extension is off, in
     /// which case nothing is tailing anything.
     logs: Option<mpsc::Receiver<serde_json::Value>>,
-    /// The lines that arrived before the platform attached logging, held until
-    /// it does. Outlives a session, like the tail that fills it: the lines a
-    /// device writes while it is negotiating are the ones a reconnect is
-    /// usually about.
+    /// Log lines waiting for the next flush.
+    ///
+    /// Everything the tail produces waits here for up to a second and then
+    /// goes out as one message. Outlives a session, like the tail that fills
+    /// it: what a device writes while it is negotiating is what a reconnect is
+    /// usually about, and the platform will not take it until the extension is
+    /// attached.
     pending_logs: logging::Pending,
     shell: Option<ShellSession>,
     /// The install in flight, if there is one.
@@ -263,6 +266,8 @@ impl Agent {
             None
         };
 
+        let pending_lines = logging::pending_lines(config.extensions.logging.max_lines_per_batch);
+
         let geo = Geo::new(config.extensions.geo.source.clone());
         let network_identity = NetworkIdentity::new(&config.extensions.network_identity);
 
@@ -282,7 +287,7 @@ impl Agent {
             network_identity,
             script_results: mpsc::channel(8),
             logs,
-            pending_logs: logging::Pending::new(logging::PENDING_LINES),
+            pending_logs: logging::Pending::new(pending_lines),
             shell: None,
             install: None,
             firmware,
@@ -370,6 +375,13 @@ impl Agent {
         ));
         heartbeat.tick().await;
 
+        // Ticks whether or not logging is on. A timer the session already has
+        // to hold costs nothing next to a second branch through every join.
+        let mut log_flush = tokio::time::interval(logging::FLUSH_INTERVAL);
+        log_flush.tick().await;
+
+        let max_lines_per_batch = self.config.extensions.logging.max_lines_per_batch;
+
         loop {
             tokio::select! {
                 incoming = transport.recv() => {
@@ -407,26 +419,28 @@ impl Agent {
                                 transport.send(&link.extension(&event, payload)).await?;
                             }
 
-                            // Confirmed first, then whatever the tail wrote
-                            // before there was anywhere to put it. Sent one at
-                            // a time and dropped only once each has gone, so a
-                            // socket that dies part way through leaves the rest
-                            // for the next session rather than eating it.
-                            if link.extension_attached(crate::extensions::LOGGING)
-                                && !self.pending_logs.is_empty()
-                            {
-                                log::info!(
-                                    "logging attached; sending {} lines held until it was",
-                                    self.pending_logs.len()
-                                );
-
-                                while let Some(line) = self.pending_logs.front() {
-                                    transport
-                                        .send(&link.extension("logging:send", line))
-                                        .await?;
-
-                                    self.pending_logs.sent();
+                            // Whatever the tail wrote while there was nowhere
+                            // to send it goes out on the next flush, which is
+                            // at most a second away.
+                            if link.extension_attached(crate::extensions::LOGGING) {
+                                if !self.pending_logs.is_empty() {
+                                    log::info!(
+                                        "logging attached; {} lines are waiting",
+                                        self.pending_logs.len()
+                                    );
                                 }
+                            } else if self.logs.is_some() {
+                                // Either an operator turned logging off for
+                                // this product, or the platform does not have
+                                // the version of the extension this agent
+                                // offers. Worth saying out loud: the tail is
+                                // still running and filling a buffer nothing
+                                // will drain, which from the outside looks
+                                // exactly like logs that go missing.
+                                log::warn!(
+                                    "the platform did not attach logging; lines are being \
+                                     buffered and dropped rather than sent"
+                                );
                             }
                         }
 
@@ -522,16 +536,31 @@ impl Agent {
                 },
 
                 line = recv_log(&mut self.logs) => {
+                    // Buffered, never sent from here. NervesHub limits how
+                    // often a device may send rather than how much it may say,
+                    // so a line at a time is the shape that loses lines; the
+                    // flush below turns a second of them into one message.
+                    self.pending_logs.push(line);
+                }
+
+                _ = log_flush.tick() => {
                     // Only once the platform has attached logging: sending
                     // before the attach would be answering a question nobody
-                    // asked. The tail runs regardless, and what it writes in
-                    // the meantime waits in a bounded buffer to go out at the
-                    // attach, so a device does not lose the lines written while
-                    // it was negotiating.
-                    if link.extension_attached(crate::extensions::LOGGING) {
-                        transport.send(&link.extension("logging:send", line)).await?;
-                    } else {
-                        self.pending_logs.push(line);
+                    // asked, and the lines keep until it does.
+                    if link.extension_attached(crate::extensions::LOGGING)
+                        && !self.pending_logs.is_empty()
+                    {
+                        let batch = self.pending_logs.batch(max_lines_per_batch);
+                        let sent = batch.len();
+
+                        // Dropped only once the message has gone, so a socket
+                        // that dies on this send leaves the lines for the next
+                        // session rather than eating them.
+                        transport
+                            .send(&link.extension("logging:send", logging::batch_payload(batch)))
+                            .await?;
+
+                        self.pending_logs.sent(sent);
                     }
                 }
 
