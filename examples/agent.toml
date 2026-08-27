@@ -150,13 +150,6 @@ policy = "immediate"     # "immediate" | "ask" | "never"
 # for an init system that wants to sequence its own shutdown.
 command = "sudo reboot"
 
-[health]
-# Off by default: an extension sends data an operator may not expect a device to
-# send, so it is asked for rather than assumed.
-enabled = false
-interval_secs = 900
-
-
 # ---------------------------------------------------------------------------
 # Extensions.
 #
