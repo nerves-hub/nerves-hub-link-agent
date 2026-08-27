@@ -175,11 +175,14 @@ Everything NervesHub can ask a device for that is not firmware. All five are off
 by default: an extension sends data, or opens a way in, that an operator may not
 expect a device to have.
 
-Both halves have to agree. The device offers what its config enables, the
-platform replies with the subset it wants attached, and that subset narrows per
-product and per device. Nothing is reported on a schedule the device chose —
-health and geo answer when asked, and logging is the only one that sends
-unprompted.
+Both halves have to agree, and the platform asks first. It says which
+extensions it has and at which versions; the agent offers back the ones its
+config enables and it also implements; the platform replies with the subset it
+wants attached, which narrows again per product and per device. A platform too
+old to ask is offered everything, a few seconds after connecting.
+
+Nothing is reported on a schedule the device chose — health and geo answer when
+asked, and logging is the only one that sends unprompted.
 
 | | |
 | --- | --- |

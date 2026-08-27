@@ -22,6 +22,13 @@ use crate::update_tool::UpdateTool;
 use crate::{FirmwareMeta, Stage, UpdatePayload};
 use serde_json::json;
 
+/// How long to wait for `extensions:get` before offering extensions anyway.
+///
+/// Far longer than a round trip, and short enough that the only visible cost
+/// against a platform that does not advertise is a few seconds of delay before
+/// the first health report.
+const EXTENSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The configured update tool.
 ///
 /// An enum rather than `Box<dyn UpdateTool>` because installing is async and
@@ -380,6 +387,13 @@ impl Agent {
         let mut log_flush = tokio::time::interval(logging::FLUSH_INTERVAL);
         log_flush.tick().await;
 
+        // Set once the device topic is joined, cleared by whichever of the
+        // advertisement and the deadline gets there first. Per session,
+        // because a reconnect negotiates again from nothing: what the platform
+        // has may have changed, and it is a new socket either way.
+        let mut extensions_deadline: Option<tokio::time::Instant> = None;
+        let mut extensions_joined = false;
+
         let max_lines_per_batch = self.config.extensions.logging.max_lines_per_batch;
 
         loop {
@@ -398,8 +412,15 @@ impl Agent {
                             );
                             self.set_connection(ConnectionState::Connected).await;
 
+                            // Extensions are not joined here. The platform
+                            // answers this join with `extensions:get`, which
+                            // says which extensions it has and at which
+                            // versions, and joining before it arrives means
+                            // declaring versions without knowing what is on
+                            // the other end.
                             if link.has_extensions() {
-                                transport.send(&link.join_extensions()).await?;
+                                extensions_deadline =
+                                    Some(tokio::time::Instant::now() + EXTENSIONS_WAIT);
                             }
 
                             if let Some(update) = *update {
@@ -410,6 +431,17 @@ impl Agent {
                                 } else {
                                     self.on_update(&mut link, &mut transport, update).await?;
                                 }
+                            }
+                        }
+
+                        Action::ExtensionsRequested(advertisement) => {
+                            if !extensions_joined {
+                                extensions_joined = true;
+                                extensions_deadline = None;
+
+                                transport
+                                    .send(&link.join_extensions(advertisement.as_ref()))
+                                    .await?;
                             }
                         }
 
@@ -499,6 +531,22 @@ impl Agent {
 
                 _ = heartbeat.tick() => {
                     transport.send(&link.heartbeat()).await?;
+                }
+
+                // Nothing came. A NervesHub old enough not to send
+                // `extensions:get` still serves the extensions it always did,
+                // so offering everything beats waiting out a session for a
+                // message that is never coming.
+                _ = wait_until(extensions_deadline), if !extensions_joined => {
+                    log::info!(
+                        "no extensions advertisement after {}s; offering what this agent implements",
+                        EXTENSIONS_WAIT.as_secs()
+                    );
+
+                    extensions_joined = true;
+                    extensions_deadline = None;
+
+                    transport.send(&link.join_extensions(None)).await?;
                 }
 
                 // An install reports through the session loop like anything
@@ -1055,6 +1103,18 @@ async fn next_install_event(install: &mut Option<InstallSession>) -> InstallEven
         }
 
         finished = &mut session.task => InstallEvent::Finished(Box::new(finished)),
+    }
+}
+
+/// Completes at `deadline`, or never if there is not one.
+///
+/// Parking rather than completing is what lets this sit in the `select!` with
+/// no deadline set: an arm that returns instantly forever starves every other
+/// arm in the loop.
+async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

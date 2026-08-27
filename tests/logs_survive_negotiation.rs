@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nerves_hub_link_agent::agent::{Agent, Tool};
-use nerves_hub_link_agent::message::{event, Message};
+use nerves_hub_link_agent::message::{event, Message, DEVICE_TOPIC};
 use nerves_hub_link_agent::Config;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -175,6 +175,19 @@ async fn fake_nerveshub(events: UnboundedSender<Seen>) -> u16 {
                             let reply = reply(&message, json!({}));
                             let _ = socket.send(WsMessage::Text(reply)).await;
                             let _ = events.send(Seen::Joined);
+
+                            // The device waits to be asked before it joins the
+                            // extensions topic, and answers with the subset of
+                            // this it also implements.
+                            let request = Message::new(
+                                DEVICE_TOPIC,
+                                event::EXTENSIONS_GET,
+                                json!({ "extensions": { "logging": ["0.1.0", "0.0.1"] } }),
+                            );
+
+                            let _ = socket
+                                .send(WsMessage::Text(request.encode().unwrap()))
+                                .await;
                         }
 
                         "logging:attached" => {
