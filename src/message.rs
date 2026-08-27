@@ -79,6 +79,13 @@ pub mod event {
     /// falls back to typing the script into the console instead.
     pub const SCRIPTS_RUN: &str = "scripts/run";
 
+    /// Server -> device: which extensions the platform has, and the versions
+    /// of each. Answered by joining the `extensions` topic with the subset
+    /// this agent also implements, so a device never declares a version
+    /// nothing can serve. Sent once the device topic is joined, and only to
+    /// devices reporting `device_api_version >= 2.2.0`.
+    pub const EXTENSIONS_GET: &str = "extensions:get";
+
     /// Server -> device: make yourself known. Sent when an operator presses
     /// Identify, so that someone standing in front of a shelf of identical
     /// boxes can tell which one they are looking at.
