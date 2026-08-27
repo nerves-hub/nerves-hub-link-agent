@@ -1,169 +1,221 @@
-# NervesHubLink Agent
+# NervesHub Link Agent
 
-A NervesHub device agent for Linux that is not running Nerves. There is no BEAM
-on the device, the application is its own process in its own language, and
-firmware is written by a program that already exists: `fwup` on a Buildroot or
-Nerves-adjacent image, `rauc` on Yocto.
+A NervesHub device agent for Linux systems that are not running Nerves.
 
-The agent connects over Phoenix Channels, reports what firmware the device is
-running, asks the application whether an update may be installed, and runs the
-updater.
+The agent is a single Rust binary that links nothing but libc. Your application
+stays its own process in whatever language you already use, and firmware is
+written by a tool the image already has — [`fwup`](docs/fwup.md) on Buildroot
+and Nerves-adjacent images, [`rauc`](docs/rauc.md) on Yocto.
+
+It connects to NervesHub over Phoenix Channels and:
+
+- reports which firmware the device is running
+- receives update assignments, downloads them, and runs the updater
+- asks your application whether an update may be installed, and whether the
+  device may reboot
+- confirms a good boot so the bootloader releases its rollback
+- runs support scripts, and answers health, geo, logging, remote shell and
+  network identity requests
 
 ## Status
 
-Working, and exercised end to end against a real NervesHub. Both update tools
-install, roll back and validate on a QEMU rig with a real bootloader. It has not
-yet run on production hardware.
+Exercised end to end against a real NervesHub. Both update tools install, roll
+back and validate on a QEMU rig with a real bootloader. It has not yet run on
+production hardware.
 
-Not implemented: client-certificate identity (the agent refuses that config
-rather than starting and failing later) and resumable downloads.
+Two things are not implemented. Client-certificate identity — the agent
+*refuses* a config containing it rather than starting and failing later — and
+resumable downloads.
 
-## Try it
-
-The fastest loop runs the agent natively against a NervesHub on your own
-machine. It cannot touch anything outside `./tmp`.
-
-Start NervesHub with `WEB_HOST` set to your machine's LAN IP, so the firmware
-URLs it generates are reachable from wherever the agent runs:
-
-```bash
-WEB_HOST=192.168.1.10 mix phx.server
-```
-
-In the UI, create an org and a product, then Product → Settings → Shared
-Secrets → create one. Put the key, the secret and that IP into
-[`examples/local.toml`](examples/local.toml), then:
-
-```bash
-cargo run -- --config examples/local.toml
-```
-
-In another terminal, the stand-in for the application on the device:
-
-```bash
-python3 examples/controller.py tmp/agent.sock
-```
-
-Upload a firmware and send it to the device from a deployment group. The agent
-asks the controller, the controller answers, and the whole conversation is
-visible in both terminals.
-
-### Why that is safe to run natively
-
-`examples/local.toml` uses the **sandbox** update tool. It downloads firmware,
-checks its SHA-256, writes it into `tmp/sandbox/` and stops. It never invokes an
-updater, never opens a block device, and "reboot" is a log line.
-
-That covers most of the agent: authentication, the join payload, deployment
-targeting, progress, reconnects and the entire IPC decision path. It tells you
-nothing about signature verification, slot switching or rollback, which is what
-the real tools decide.
-
-The moment the update tool is not the sandbox, that guarantee is gone — `fwup`
-writes to whatever `-d` names, immediately and with no undo. Two things stand in
-the way: the agent refuses to start if fwup's target is not a regular file
-unless `allow_block_device` says otherwise, and `docker compose up --build` runs
-it with no devices mapped in and no host paths mounted but the config.
-
-### If it will not connect
-
-The agent talks to the **web** endpoint on port 4000 at `/device-socket` with an
-HMAC shared secret — one address for both the socket and the firmware download,
-and no self-signed certificate to work around. The separate device endpoint on
-4001 is the mutual-TLS one.
+## Requirements
 
 | | |
 | --- | --- |
-| `401 Unauthorized` | right path, secret rejected. Check the key and secret, and **check the clock**: the signature carries a timestamp the server refuses when it is more than 90 seconds stale, so a device whose clock has drifted fails in a way that reads exactly like a bad secret |
-| `403 Forbidden` | you are on `/socket`, which on port 4000 is the *user* socket |
-| connection refused | wrong port, or the server is not up |
+| **A Linux device** | The agent reads `/proc` and `/sys` and shells out to your updater. It builds and runs on macOS for development, but health metrics come back empty there. |
+| **An update tool** | `fwup` or `rauc`, already in the image and already configured for A/B updates. The agent runs it; it does not replace it. |
+| **A NervesHub** | [NervesCloud](https://nervescloud.com), or your own deployment. |
+| **Rust 1.85+** | To build. See [docs/deploying.md](docs/deploying.md) for cross-compiling and for Buildroot and Yocto packaging. |
 
-`RUST_LOG=nerves_hub_link_agent=debug` logs the URL it dials and every frame in
-both directions.
+## Getting started
 
-## Update tools
+The goal of this section is a device that shows up in NervesHub. It uses the
+**sandbox** update tool, which downloads firmware, verifies its SHA-256, writes
+it to a file and stops — no block devices, no bootloader, and "reboot" is a log
+line. That exercises authentication, identity, deployment targeting, progress
+reporting and reconnects, which is everything except the part that writes to a
+disk. Swap in a real update tool once it connects.
 
-One per device, chosen in the config. Each has a guide covering what the image
+### 1. Build
+
+```bash
+cargo build --release
+```
+
+This produces `nerves-hub-link-agent` and `agent-ctl` in `target/release/`. The
+default feature set is `sandbox` and `fwup`; see
+[Building](#building-from-source) for the others.
+
+### 2. Create a shared secret
+
+In the NervesHub web UI: create an organization and a product, then go to
+**Product → Settings → Shared Secrets** and create one. You get a product key
+(`nhp_...`) and a product secret.
+
+A shared secret authenticates the *product*, not the device, so the agent sends
+a device identifier alongside it. NervesHub registers an identifier it has not
+seen before — which is what makes one factory image work for a whole fleet, and
+also means a wrong identifier quietly creates a second device instead of
+failing.
+
+### 3. Write a config
+
+The agent reads one TOML file: `/etc/nerves-hub-link-agent.toml`, unless
+`--config` or `$NERVES_HUB_AGENT_CONFIG` points elsewhere. Nothing is read from
+the environment field by field, so a device's configuration is one file you can
+read and diff.
+
+For **NervesCloud**:
+
+```toml
+[server]
+host = "devices.nervescloud.com"
+# port = 443, tls = true and path = "/device-socket" are the defaults
+
+[identity]
+product_key = "nhp_..."
+product_secret = "..."
+identifier = { literal = "bench-01" }
+
+[update_tool]
+name = "sandbox"
+work_dir = "/tmp/nerves-hub-agent"
+initial_firmware = { uuid = "00000000-0000-0000-0000-000000000000", version = "0.1.0", product = "my-product", platform = "sandbox", architecture = "x86_64" }
+
+[ipc]
+socket = "/tmp/nerves-hub-agent.sock"
+```
+
+For **your own NervesHub**, change `host` to your deployment's device endpoint.
+Which port and path depends on how it is deployed and which endpoint accepts
+shared secrets — [docs/connecting.md](docs/connecting.md) covers both endpoints,
+TLS, and what each authentication failure actually means.
+
+### 4. Run it
+
+```bash
+./target/release/nerves-hub-link-agent --config agent.toml
+```
+
+The device appears in NervesHub under the identifier you configured. Add
+`RUST_LOG=nerves_hub_link_agent=debug` to log the URL it dials and every frame
+in both directions.
+
+The startup line reads `update tool fwup (sandboxed)`. That is not a mistake —
+the sandbox reports itself to NervesHub as `fwup`, because it stands in for the
+fwup path rather than being a firmware format of its own. `(sandboxed)` is the
+part that tells you nothing on this device can be written to.
+
+If it does not connect, the failure is almost always the credential, the clock
+or the path. [docs/connecting.md](docs/connecting.md) has the table.
+
+### 5. Send it an update
+
+Upload a firmware to the product and target the device from a deployment group.
+The sandbox tool downloads it, verifies it and writes it into `work_dir`, and
+you can watch progress in the UI.
+
+### 6. Switch to a real update tool
+
+Sandbox exists to prove the connection. Replace the `[update_tool]` block with
+[fwup](docs/fwup.md) or [rauc](docs/rauc.md) — each guide covers what the image
 must provide, how to configure the agent, and a QEMU rig that boots, rolls back
 and validates for real.
 
+Then read [docs/deploying.md](docs/deploying.md) for the parts that only matter
+on hardware: cross-compiling, the service user, the systemd unit, and where the
+device identifier has to live so it survives a rootfs update.
+
+## Update tools
+
+One per device, chosen in the config and compiled in as a feature.
+
 | | |
 | --- | --- |
-| **[fwup](docs/fwup.md)** | The archive streams into `fwup`'s stdin as it downloads, so the device needs no free space beyond the slot it writes into. Deltas are NervesHub's job; the agent only has to report its fwup version honestly. |
-| **[rauc](docs/rauc.md)** | `rauc install <url>`. The bundle is never downloaded first: RAUC streams it and fetches only the blocks the target slot lacks, so a small change costs a small download without anyone generating a patch. |
-| **sandbox** | Downloads, verifies, writes to a file, stops. In the default feature set deliberately: a build that has not been told which real updater to use should not be able to write to a disk. |
+| **[fwup](docs/fwup.md)** | The archive streams into `fwup`'s stdin as it downloads, so the device needs no free space beyond the slot it writes into. Deltas are NervesHub's job; the agent reports its fwup version and lets the server decide. |
+| **[rauc](docs/rauc.md)** | `rauc install <url>`. The bundle is never downloaded first — RAUC streams it and fetches only the blocks the target slot lacks, so a small change costs a small download without anyone generating a patch. |
+| **sandbox** | Downloads, verifies, writes to a file, stops. For bring-up and for CI, and it reports itself to NervesHub as `fwup` since it stands in for that path. In the default feature set deliberately: a build that has not been told which real updater to use should not be able to write to a disk. |
 
-Both rigs live in [`test/device/`](test/device/) and are selected at build time
-with `--build-arg BOOT_SCHEME=fwup|rauc`. They are different systems, not one
-system with a flag: different boot scripts, different bootloader environments,
-different agent configs.
+The agent does not write firmware itself. It hands the update to a tool that
+does, and those tools disagree about where bytes come from — `fwup` reads an
+archive from stdin, `rauc` wants a URL so it can stream. So an update tool owns
+the transfer rather than being handed a sink to fill.
 
-For a real device rather than a rig — cross-compiling, the service user, the
-systemd unit, and Buildroot and Yocto packaging — see
-**[docs/deploying.md](docs/deploying.md)**. The binary links nothing but libc,
-which is the main reason TLS is rustls rather than the system OpenSSL.
+## Configuration
 
-A Buildroot br2-external tree is in [`support/buildroot/`](support/buildroot/)
-and the Yocto layer in [meta-nerveshub][meta-nerveshub], each with a script that
-builds it in a container. Both produce a working package: Buildroot against
-2025.08, Yocto against scarthgap. The Yocto layer requires
-[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin) for the
-toolchain, because no released Yocto ships a Rust new enough.
+[`examples/agent.toml`](examples/agent.toml) is every option, annotated, with
+defaults marked. The decisions worth making before you ship anything:
 
-## Why it looks like this
+**Identity.** Where the device identifier comes from: a literal, a file, or a
+command. On real hardware prefer the hardware's own serial
+(`{ file = "/sys/firmware/devicetree/base/serial-number" }`) or a value on a
+data partition — a literal in a shipped image makes every device the same
+device, and an identifier baked into the rootfs is gone after the first update.
 
-Two constraints account for most of the design.
+**Update policy.** `apply` installs whatever arrives, matching `nerves_hub_link`
+out of the box. `ask` puts your application in the path.
 
-**The agent cannot decide when to update.** The application knows whether the
-machine is mid-cycle, whether an operator is standing at it, whether the queue
-is drained. So "should I install this?" and "may I reboot now?" have to cross a
-process boundary and come back with an answer — including when the application
-has crashed, has not started yet, or never answers.
+**Reboot policy.** Separate from update policy on purpose. An application happy
+to download at any time may still be unable to reboot right now, and conflating
+the two forces it to refuse the download in order to protect the reboot.
 
-**The agent does not write firmware.** It runs something that does, and those
-programs disagree about where bytes come from. `fwup` reads an archive from
-stdin; `rauc` wants a URL so it can stream. So an update tool is handed the
-update and owns the transfer, rather than being handed a sink to fill.
+**How it reboots.** `sudo reboot` by default. The agent downloads from the
+network and runs support scripts, so it should not run as root — which means one
+sudoers rule: `agent ALL=(root) NOPASSWD: /sbin/reboot`. Use `reboot` where it
+already runs as root, or `systemctl reboot` under an init system that wants to
+sequence its own shutdown.
+
+**Timeouts.** Every question the agent asks your application has a deadline and
+a configured answer for each way it can go unanswered. An agent that blocks
+forever on an application that died is a device that has quietly left the fleet
+while still looking healthy from the server.
 
 ## Talking to the agent
 
-Newline-delimited JSON over a Unix socket. Requests go both ways: the
-application asks for status, the agent asks whether to install. Full protocol
-and worked exchanges in [`docs/ipc.md`](docs/ipc.md).
+Newline-delimited JSON over a Unix socket, and it is a peer protocol rather than
+a client/server one: your application asks the agent for status, and the agent
+asks your application whether to install. Full protocol and worked exchanges in
+[docs/ipc.md](docs/ipc.md).
 
 ```
-hello        -> welcome
-status       -> connection, identity, firmware, pending validation
-mark_valid   -> confirm this boot, releasing the bootloader's rollback
-reboot       -> reboot through the agent
+application -> agent          agent -> application
+  hello                         update_available -> apply | ignore | reschedule
+  status                        reboot_request   -> reboot | defer
+  mark_valid                    identify
+  reboot
 
-update_available -> apply | ignore | reschedule
-reboot_request   -> reboot | defer
-identify         -> blink something
-
-events: connection, update_progress, update_installed, update_failed, reboot_pending
+events: connection, update_progress, update_installed, update_failed,
+        reboot_pending
 ```
 
-Exactly one connection may be the `controller`, the one asked to decide. Others
-are observers. A second controller is refused rather than replacing the first,
-so the mistake surfaces at connect time on a bench instead of as a fleet that
-updates when it was told not to.
+Exactly one connection may be the **controller**, the one asked to decide;
+everything else is an observer. A second controller is refused rather than
+replacing the first, so the mistake surfaces at connect time on a bench instead
+of as a fleet that updates when it was told not to.
 
-Every question has a deadline and a configured answer for each way it can go
-unanswered. An agent that blocks forever on an application that died is a device
-that has quietly left the fleet while still looking healthy from the server.
+[`examples/controller.py`](examples/controller.py) is a working controller in
+about a hundred lines, if you want to see the shape of one.
 
 ### agent-ctl
 
-A minimal image has no python, no socat and no nc, which leaves `mark_valid`
-unreachable from a support script — the one place it most needs to be reachable
-from.
+A minimal image has no python, no socat and no nc, which otherwise leaves
+`mark_valid` unreachable from a support script — the one place it most needs to
+be reachable from.
 
 ```bash
 agent-ctl status        # connection, identity, firmware, whether validation is owed
 agent-ctl mark-valid    # confirm the running firmware, releasing the rollback
 agent-ctl reboot
-agent-ctl watch
+agent-ctl watch         # stream events
 ```
 
 It connects as an observer, asks one question and exits, so running it never
@@ -172,98 +224,73 @@ takes the controller slot from the application that owns it.
 ## Extensions
 
 Everything NervesHub can ask a device for that is not firmware. All five are off
-by default: an extension sends data, or opens a way in, that an operator may not
-expect a device to have.
-
-Both halves have to agree, and the platform asks first. It says which
-extensions it has and at which versions; the agent offers back the ones its
-config enables and it also implements; the platform replies with the subset it
-wants attached, which narrows again per product and per device. A platform too
-old to ask is offered everything, a few seconds after connecting.
-
-Nothing is reported on a schedule the device chose — health and geo answer when
-asked, and logging is the only one that sends unprompted.
+by default, and both halves have to agree before one attaches — the platform
+advertises what it has, the agent offers back what it also implements, and the
+platform replies with the subset it wants.
 
 | | |
 | --- | --- |
-| **health** | Memory, CPU, load and temperature from `/proc` and `/sys`. CPU is a delta between reports, so the first after a restart omits it rather than sending the since-boot average as though it were current. |
-| **geo** | A position, from `whenwhere` GeoIP, a fixed configured location, or a command for devices with a GPS. Nothing is sent when a lookup fails: a location the agent could not establish is not a location at the origin. |
-| **logging** | `journalctl --follow`, or any command that writes lines. Collected for a second and sent as one message, because NervesHub limits how often a device may send rather than how much it may say. Under systemd the agent logs with systemd's `<N>` priority prefix and no timestamp of its own, so a line reaches NervesHub with one timestamp and its real level rather than two timestamps and `info`. |
-| **local_shell** | A real pty running a shell, resizable, streamed to the browser terminal. |
-| **network_identity** | Iroh, Tailscale, NetBird or WireGuard keys, from configured commands. Asked for once on attach, never polled. |
+| **health** | Memory, CPU, load and temperature from `/proc` and `/sys`, answered when asked. |
+| **geo** | A position from GeoIP, a fixed configured location, or a command for devices with a GPS. |
+| **logging** | `journalctl --follow`, or any command that writes lines, batched a second at a time. |
+| **local_shell** | A real pty running a shell, streamed to the browser terminal. |
+| **network_identity** | Iroh, Tailscale, NetBird or WireGuard keys, from configured commands. |
 
-**health reports nothing useful on macOS.** It reads `/proc`, which is not
-there, so a native run sends an empty metric set. Inventing numbers would be
-worse, but it does mean health is one of the things you need a container for.
-
-**local_shell hands out a shell.** Whoever can open the tab in NervesHub runs
-commands as whatever the agent runs as, and the device does not get to ask who
-they are. It is off unless the config turns it on *and* NervesHub attaches it,
-and both are runtime decisions: a device that needs looking at is one you can
-already no longer reach, and having to ship it a firmware update first to get a
-shell would put the tool behind the problem it exists for.
-
-Both QEMU rigs turn it on, because a throwaway VM on a loopback port is the only
-place it can be exercised: it needs a real pty, a real terminal attached from
-NervesHub, and a session to run under. That is a rig decision, not a template —
-`test/device/agent-fwup.toml` says so where the block is.
+`local_shell` hands out a shell to whoever can open the tab in NervesHub. Read
+[docs/extensions.md](docs/extensions.md) before enabling it — that guide also
+covers the negotiation, what each extension collects, and how to configure them.
 
 ## Support scripts
 
-A support script arrives as text and runs as a shell script. On Nerves it would
-be Elixir evaluated in the running VM; there is no VM here, and the things
-someone reaches for when a device misbehaves — `journalctl`, `systemctl status`,
-`ip addr`, `df` — are commands rather than expressions.
+A support script arrives from NervesHub as text and runs as a shell script,
+because the things people reach for when a device misbehaves — `journalctl`,
+`systemctl status`, `ip addr`, `df` — are commands rather than expressions.
 
-The text is written to a file and run with `bash`. A script starting with `#!`
-is made executable and run directly, so Python or `sh` works without configuring
-anything. Running from a file rather than `-c` also means an error carries a
-line number. `stdout` and `stderr` are merged in the order they happened, and
-scripts get `NERVES_HUB_DEVICE_IDENTIFIER`, `NERVES_HUB_FIRMWARE_UUID` and
-`NERVES_HUB_FIRMWARE_VERSION` in their environment.
+Enabled by default, unlike the extensions. Scripts are per-product, and a
+product can hold both Nerves devices and agent devices, which is a trap worth
+understanding: see [docs/support-scripts.md](docs/support-scripts.md).
 
-**Scripts are per-product, and a product can hold both kinds of device.** The
-same text goes to a Nerves device and to one running this agent, so
-`VintageNet.info()` reaches a bash shell and comes back as a syntax error.
-Scripts carry tags and NervesHub filters on them, which is the seam to use when
-a product ends up mixed.
+## Building from source
 
-**Timeouts matter more than they look.** NervesHub drops a script's reference
-after 15 seconds and stops listening, so the agent's deadline is 10 by default
-and it kills the whole process group — not just the shell, which would leave
-anything the script backgrounded still running with nobody watching.
+```bash
+cargo build --release                                  # sandbox + fwup
+cargo build --release --no-default-features --features rauc
+cargo test --all-features
+```
 
-Enabled by default, unlike the extensions. Turned off, the agent still *answers*
-and says so: a device that silently ignored scripts would be indistinguishable
-from one that had gone offline.
+Minimum supported Rust is **1.85**, which is what decides the Buildroot and
+Yocto releases that can build the agent. It is tested in CI rather than guessed.
 
-## Configuration
+Update tools are cargo features, so a build that was not told about a real
+updater cannot be talked into using one by a config file. Extensions are runtime
+configuration only.
 
-One TOML file, `/etc/nerves-hub-link-agent.toml` unless `--config` or
-`$NERVES_HUB_AGENT_CONFIG` says otherwise. Nothing is read from the environment
-field by field: a device's configuration should be one file an operator can look
-at and diff, not a file plus a unit file plus whatever the init system exported.
+The tests cover the parts with no I/O in them: the policy table, the wire
+frames, the auth token, identifier resolution, and the payload shapes the server
+matches on. That is deliberate — those are where a mistake is silent. Progress
+reports going to NervesHub under a key the server does not read would fail
+nowhere.
 
-[`examples/agent.toml`](examples/agent.toml) is every option, annotated. The
-parts worth deciding before shipping anything:
+## Documentation
 
-- **Identity.** A shared secret says nothing about which device presents it, so
-  the identifier is configured alongside it — a literal, a file to read, or a
-  command to run. Nerves devices get this from `nerves_runtime`; a Yocto image
-  has no such convention, which is why all three exist.
-- **Update policy.** Defaults to applying without asking, matching
-  `nerves_hub_link` out of the box. `ask` puts the controller in the path.
-- **Reboot policy.** Separate from update policy on purpose. An application
-  happy to download at any time may still be unable to reboot right now, and
-  conflating the two forces it to refuse the download to protect the reboot.
-- **How it reboots.** `sudo reboot` by default. The agent downloads from the
-  network and runs support scripts, so it has no business running as root, which
-  means a sudoers rule for exactly this one command:
-  `agent ALL=(root) NOPASSWD: /sbin/reboot`. Set `reboot.command` to `reboot`
-  where it already runs as root, or `systemctl reboot` for an init system that
-  wants to sequence its own shutdown.
+| | |
+| --- | --- |
+| [connecting.md](docs/connecting.md) | Endpoints, shared secrets, TLS, and what each connection failure means |
+| [fwup.md](docs/fwup.md) | The fwup update tool, what the image must provide, and a QEMU rig |
+| [rauc.md](docs/rauc.md) | The RAUC update tool, what the image must provide, and a QEMU rig |
+| [deploying.md](docs/deploying.md) | Onto real hardware: cross-compiling, systemd, Buildroot, Yocto |
+| [ipc.md](docs/ipc.md) | The protocol your application speaks to the agent |
+| [extensions.md](docs/extensions.md) | health, geo, logging, local_shell, network_identity |
+| [support-scripts.md](docs/support-scripts.md) | How scripts run, and the mixed-fleet trap |
 
-## Layout
+A Buildroot br2-external tree is in [`support/buildroot/`](support/buildroot/)
+and the Yocto layer in [meta-nerveshub][meta-nerveshub], each with a script that
+builds it in a container. Buildroot is tested against 2025.08, Yocto against
+scarthgap. The Yocto layer needs
+[meta-rust-bin](https://github.com/rust-embedded/meta-rust-bin), because no
+released Yocto ships a Rust new enough.
+
+## Project layout
 
 ```
 src/
@@ -288,38 +315,30 @@ src/
     fwup.rs
     rauc.rs
   extensions/          health, geo, logging, local_shell, network_identity
-docs/
-  fwup.md              the fwup guide, including the QEMU rig
-  rauc.md              the RAUC guide, including the QEMU rig
-  deploying.md         onto a real device: cross-compiling, systemd, Buildroot, Yocto
-  ipc.md               the protocol applications speak
 test/
-  device/              the bootable A/B rigs, both boot schemes
+  device/              bootable A/B QEMU rigs, both boot schemes
   image/               a container rig with a real fwup and no bootloader
   ab/                  the fwup A/B mechanics, without an agent
 ```
 
-```bash
-cargo test --all-features
-```
+## Not implemented yet
 
-The tests are on the parts with no I/O in them: the policy table, the frames,
-the token, identifier resolution, and the payload shapes the server matches on.
-That is deliberate. Those are where a mistake is silent — progress reports went
-to NervesHub under a key the server does not read, and nothing anywhere failed.
-
-## Still open
-
-**Resumption.** A download interrupted at 90% over a metered link should not
-start again. `fwup` cannot resume, so it would have to be the agent's HTTP
+**Resumable downloads.** A download interrupted at 90% over a metered link
+starts again. `fwup` cannot resume, so it would have to be the agent's HTTP
 client; `rauc` streaming can, and would do it itself.
 
-**A D-Bus interface.** The idiomatic answer on Yocto, and RAUC is D-Bus-native,
-so an adapter is worth having. Not the primary interface, because it needs a bus
-daemon that a minimal single-purpose image often does not run.
+**Client certificates.** NervesHub supports them, and they are the better answer
+for a device that can hold a per-device key, since the identifier comes from the
+certificate's CN and cannot drift from what the server sees. The config shape is
+written down in `examples/agent.toml`; nothing behind it is implemented, and the
+agent refuses such a config rather than starting and failing later.
 
-**Client certificates.** NervesHub supports them and they are the better answer
-for a device that can hold a per-device key. The config shape is written down in
-`examples/agent.toml`; nothing behind it is implemented.
+**A D-Bus interface.** The idiomatic answer on Yocto, and RAUC is D-Bus-native.
+Not the primary interface, because it needs a bus daemon that a minimal
+single-purpose image often does not run.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 [meta-nerveshub]: https://github.com/nerves-hub/meta-nerveshub
