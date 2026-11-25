@@ -78,6 +78,11 @@ CMD ["--config", "/etc/nerves-hub-link-agent.toml"]
 # Linux and the bootloader are looking at the same bytes.
 FROM debian:bookworm-slim AS uboot
 ARG UBOOT_VERSION=2025.01
+# A version bump needs both hashes bumped with it. The first is the release
+# tarball's, the same value Buildroot pins. The second is GitHub's archive of
+# the tag: the same tree inside, but not the same bytes.
+ARG UBOOT_SHA256=cdef7d507c93f1bbd9f015ea9bc21fa074268481405501945abc6f854d5b686f
+ARG UBOOT_GITHUB_SHA256=2c238311e1f61e4baf8e63da8a84dd382cfc3a38872081ea3fba10a13df293e2
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bc bison build-essential ca-certificates curl flex \
@@ -89,10 +94,27 @@ RUN apt-get update \
 
 COPY test/device/uboot.config /tmp/uboot.config
 
-RUN curl -fsSL -o /tmp/u-boot.tar.bz2 \
-        "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" \
-    && tar -xjf /tmp/u-boot.tar.bz2 -C /tmp \
-    && cd "/tmp/u-boot-${UBOOT_VERSION}" \
+# The release tarball from ftp.denx.de, else Buildroot's copy of that same
+# tarball, else GitHub's archive of the tag. ftp.denx.de has stopped answering
+# long enough to fail every image build, and curl's default would wait over two
+# minutes to connect, so each host gets ten seconds and two retries. Whatever
+# arrives must match its pinned hash, so a fallback cannot hand the build
+# something nobody reviewed. The archives name their top directory differently,
+# hence --strip-components.
+RUN fetch() { \
+        curl -fsSL --connect-timeout 10 --retry 2 --retry-delay 1 --retry-connrefused \
+            -o /tmp/u-boot.tar "$1" \
+        && echo "$2  /tmp/u-boot.tar" | sha256sum --check --strict --quiet - \
+        || { echo "u-boot: nothing usable from $1" >&2; return 1; }; \
+    } \
+    && { fetch "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" "${UBOOT_SHA256}" \
+        || fetch "https://sources.buildroot.net/uboot/u-boot-${UBOOT_VERSION}.tar.bz2" "${UBOOT_SHA256}" \
+        || fetch "https://github.com/u-boot/u-boot/archive/refs/tags/v${UBOOT_VERSION}.tar.gz" "${UBOOT_GITHUB_SHA256}"; } \
+    && mkdir "/tmp/u-boot-${UBOOT_VERSION}" \
+    && tar -xf /tmp/u-boot.tar --strip-components=1 -C "/tmp/u-boot-${UBOOT_VERSION}" \
+    && rm /tmp/u-boot.tar
+
+RUN cd "/tmp/u-boot-${UBOOT_VERSION}" \
     && make qemu_arm64_defconfig \
     && cat /tmp/uboot.config >> .config \
     && make olddefconfig \
