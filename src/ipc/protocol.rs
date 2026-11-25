@@ -168,8 +168,15 @@ pub struct ErrorBody {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum UpdateDecision {
     Apply,
-    Ignore { reason: String },
-    Reschedule { delay_ms: u64, reason: String },
+    Ignore {
+        reason: String,
+    },
+    /// Hold the update off for `delay_minutes` whole minutes, the unit
+    /// NervesHub reads. Anything under 5 is sent as 5.
+    Reschedule {
+        delay_minutes: u64,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -251,4 +258,51 @@ pub struct Request {
     pub id: String,
     #[serde(flatten)]
     pub method: Method,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(line: &str) -> Response {
+        match serde_json::from_str(line).unwrap() {
+            Frame::Response { result, .. } => result,
+            other => panic!("not a response: {other:?}"),
+        }
+    }
+
+    /// The exchange as `docs/ipc.md` shows it.
+    #[test]
+    fn a_reschedule_answer_is_in_minutes() {
+        let response = answer(
+            r#"{"type":"response","id":"a1","result":{"action":"reschedule","delay_minutes":10,"reason":"cycle in progress"}}"#,
+        );
+
+        assert_eq!(
+            response,
+            Response::Ok {
+                result: ResponseBody::Update(UpdateDecision::Reschedule {
+                    delay_minutes: 10,
+                    reason: "cycle in progress".into(),
+                }),
+            }
+        );
+    }
+
+    /// `delay_ms` was the field before the delay moved to minutes. Reading it
+    /// as minutes would hold a device back 60,000 times longer than asked, so
+    /// an answer that still carries it is not taken as a reschedule at all.
+    #[test]
+    fn a_reschedule_in_milliseconds_is_not_a_decision() {
+        let response = answer(
+            r#"{"type":"response","id":"a1","result":{"action":"reschedule","delay_ms":600000,"reason":"cycle in progress"}}"#,
+        );
+
+        assert!(!matches!(
+            response,
+            Response::Ok {
+                result: ResponseBody::Update(_)
+            }
+        ));
+    }
 }

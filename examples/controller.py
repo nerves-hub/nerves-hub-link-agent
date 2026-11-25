@@ -21,7 +21,7 @@ SOCKET = sys.argv[1] if len(sys.argv) > 1 else "tmp/agent.sock"
 #
 #   {"action": "apply"}
 #   {"action": "ignore", "reason": "not now"}
-#   {"action": "reschedule", "delay_ms": 600000, "reason": "cycle in progress"}
+#   {"action": "reschedule", "delay_minutes": 10, "reason": "cycle in progress"}
 UPDATE_ANSWER = {"action": "apply"}
 
 #   {"action": "reboot"}

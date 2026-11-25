@@ -96,16 +96,22 @@ Only the controller receives these.
 ```
 
 ```json
-{"type":"response","id":"a1","result":{"action":"reschedule","delay_ms":600000,"reason":"cycle in progress"}}
+{"type":"response","id":"a1","result":{"action":"reschedule","delay_minutes":10,"reason":"cycle in progress"}}
 ```
 
-`action` is `apply`, `ignore` (with `reason`), or `reschedule` (with `delay_ms`
-and `reason`). The three map onto statuses NervesHub already understands, which
-is the difference between a deliberate deferral and a device that looks broken:
-`ignore` puts the device in its deployment's penalty box, and `reschedule`
-blocks updates for exactly the delay asked for. `delay_ms` is not decoration —
-the server computes `updates_blocked_until` from it and refuses the message
-without it.
+`action` is `apply`, `ignore` (with `reason`), or `reschedule` (with
+`delay_minutes` and `reason`). The three map onto statuses NervesHub already
+understands, which is the difference between a deliberate deferral and a device
+that looks broken: `ignore` puts the device in its deployment's penalty box, and
+`reschedule` blocks updates for exactly the delay asked for. `delay_minutes` is
+not decoration — the server computes `updates_blocked_until` from it and refuses
+the message without it.
+
+`delay_minutes` is whole minutes, the unit NervesHub reads. Anything under 5 is
+sent as 5, the same minimum `nerves_hub_link` uses.
+Earlier versions of the agent took `delay_ms` here instead. A `reschedule` that
+still carries `delay_ms` is not understood: the agent logs a warning and does
+what `updates.on_timeout` says, which by default is to apply.
 
 ### `reboot_request`
 

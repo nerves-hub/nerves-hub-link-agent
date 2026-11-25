@@ -790,14 +790,23 @@ impl Agent {
                 return Ok(());
             }
 
-            UpdateDecision::Reschedule { delay_ms, reason } => {
+            UpdateDecision::Reschedule {
+                delay_minutes,
+                reason,
+            } => {
                 // Reported rather than just slept on, and reported *with* the
                 // delay: the server sets `updates_blocked_until` from it, which
                 // is what makes a deferral visible instead of looking like a
                 // device gone quiet.
-                transport.send(&link.rescheduled(delay_ms, &reason)).await?;
+                let message = link.rescheduled(delay_minutes, &reason);
+                transport.send(&message).await?;
 
-                log::info!("update rescheduled for {delay_ms}ms: {reason}");
+                // What was sent, which is not what was asked for when the
+                // controller asked for less than the minimum.
+                log::info!(
+                    "update rescheduled for {} min: {reason}",
+                    message.payload["delay_for"]
+                );
                 return Ok(());
             }
 
@@ -1227,8 +1236,19 @@ fn update_decision(response: Response) -> Option<UpdateDecision> {
         Response::Ok {
             result: ResponseBody::Update(decision),
         } => Some(decision),
-        // An error or an unexpected body is not an answer. Treated as silence
-        // so it lands on the configured fallback rather than inventing one.
+        // A body that is not a decision, such as a reschedule still carrying
+        // `delay_ms` from before the delay moved to minutes. Silence, like
+        // the error below, but warned about: the controller believes it
+        // answered, and the fallback may well be to apply.
+        Response::Ok { result } => {
+            log::warn!(
+                "ipc: controller's answer to update_available is not apply, ignore or \
+                 reschedule with delay_minutes, treating it as no answer: {result:?}"
+            );
+            None
+        }
+        // An error is not an answer. Treated as silence so it lands on the
+        // configured fallback rather than inventing one.
         _ => None,
     }
 }

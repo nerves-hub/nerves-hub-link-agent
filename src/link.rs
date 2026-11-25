@@ -14,6 +14,11 @@ use crate::extensions::{Extensions, Incoming, EXTENSIONS_TOPIC};
 use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::{Stage, UpdatePayload};
 
+/// The shortest reschedule sent to NervesHub, in minutes. A shorter delay is
+/// raised to this, as `nerves_hub_link` does, so a device that asks for 0 is
+/// not offered the same update again straight away.
+pub const MIN_RESCHEDULE_MINUTES: u64 = 5;
+
 /// Something the run loop has to act on, beyond replying on the channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -204,17 +209,27 @@ impl Link {
         )
     }
 
-    /// Ask NervesHub to hold off for `delay_ms`.
+    /// Ask NervesHub to hold off for `delay_minutes` whole minutes.
+    ///
+    /// `delay_for` is in minutes, which is what `nerves_hub_link` sends and
+    /// what NervesHub's docs describe. Milliseconds read as minutes hold a
+    /// device back 60,000 times longer than it asked for.
     ///
     /// `delay_for` is required, and not merely to be informative. The server
     /// matches `status_update("rescheduled", _, %{"delay_for" => delay_for}, _)`
     /// and computes `updates_blocked_until` from it — so without the key there
     /// is no matching clause, the call raises inside the device's channel
     /// process, and the deferral the device asked for never happens.
-    pub fn rescheduled(&mut self, delay_ms: u64, reason: &str) -> Message {
+    ///
+    /// A delay under [`MIN_RESCHEDULE_MINUTES`] is sent as that minimum.
+    pub fn rescheduled(&mut self, delay_minutes: u64, reason: &str) -> Message {
         self.device_message(
             event::STATUS_UPDATE,
-            json!({ "status": "rescheduled", "reason": reason, "delay_for": delay_ms }),
+            json!({
+                "status": "rescheduled",
+                "reason": reason,
+                "delay_for": delay_minutes.max(MIN_RESCHEDULE_MINUTES),
+            }),
         )
     }
 
@@ -381,12 +396,27 @@ mod tests {
     #[test]
     fn a_reschedule_carries_the_delay() {
         let mut link = Link::new("2.2.0", "fwup", &ExtensionsConfig::default());
-        let message = link.rescheduled(60_000, "busy");
+        let message = link.rescheduled(15, "busy");
 
         assert_eq!(message.event, event::STATUS_UPDATE);
         assert_eq!(message.payload["status"], json!("rescheduled"));
-        assert_eq!(message.payload["delay_for"], json!(60_000));
+        assert_eq!(message.payload["delay_for"], json!(15));
         assert_eq!(message.payload["reason"], json!("busy"));
+    }
+
+    /// `nerves_hub_link` never asks for less than five minutes, and neither
+    /// does the agent.
+    #[test]
+    fn a_reschedule_is_at_least_five_minutes() {
+        let mut link = Link::new("2.2.0", "fwup", &ExtensionsConfig::default());
+
+        for asked in [0, 1, 4] {
+            let message = link.rescheduled(asked, "busy");
+            assert_eq!(message.payload["delay_for"], json!(5), "asked for {asked}");
+        }
+
+        let message = link.rescheduled(5, "busy");
+        assert_eq!(message.payload["delay_for"], json!(5));
     }
 
     #[allow(dead_code)]
