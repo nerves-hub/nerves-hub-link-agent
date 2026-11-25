@@ -204,17 +204,28 @@ impl Link {
         )
     }
 
-    /// Ask NervesHub to hold off for `delay_ms`.
+    /// Ask NervesHub to hold off for `delay_minutes` whole minutes.
+    ///
+    /// `delay_for` is in minutes, which is what `nerves_hub_link` sends and
+    /// what NervesHub's docs describe. Milliseconds read as minutes hold a
+    /// device back 60,000 times longer than it asked for.
     ///
     /// `delay_for` is required, and not merely to be informative. The server
     /// matches `status_update("rescheduled", _, %{"delay_for" => delay_for}, _)`
     /// and computes `updates_blocked_until` from it — so without the key there
     /// is no matching clause, the call raises inside the device's channel
     /// process, and the deferral the device asked for never happens.
-    pub fn rescheduled(&mut self, delay_ms: u64, reason: &str) -> Message {
+    ///
+    /// A delay of 0 is sent as 1. Zero minutes blocks nothing, so the device
+    /// could be offered the same update again straight away.
+    pub fn rescheduled(&mut self, delay_minutes: u64, reason: &str) -> Message {
         self.device_message(
             event::STATUS_UPDATE,
-            json!({ "status": "rescheduled", "reason": reason, "delay_for": delay_ms }),
+            json!({
+                "status": "rescheduled",
+                "reason": reason,
+                "delay_for": delay_minutes.max(1),
+            }),
         )
     }
 
@@ -381,12 +392,22 @@ mod tests {
     #[test]
     fn a_reschedule_carries_the_delay() {
         let mut link = Link::new("2.2.0", "fwup", &ExtensionsConfig::default());
-        let message = link.rescheduled(60_000, "busy");
+        let message = link.rescheduled(15, "busy");
 
         assert_eq!(message.event, event::STATUS_UPDATE);
         assert_eq!(message.payload["status"], json!("rescheduled"));
-        assert_eq!(message.payload["delay_for"], json!(60_000));
+        assert_eq!(message.payload["delay_for"], json!(15));
         assert_eq!(message.payload["reason"], json!("busy"));
+    }
+
+    /// Zero minutes blocks nothing, so it is sent as the shortest delay that
+    /// does.
+    #[test]
+    fn a_reschedule_is_at_least_a_minute() {
+        let mut link = Link::new("2.2.0", "fwup", &ExtensionsConfig::default());
+        let message = link.rescheduled(0, "busy");
+
+        assert_eq!(message.payload["delay_for"], json!(1));
     }
 
     #[allow(dead_code)]
