@@ -798,11 +798,15 @@ impl Agent {
                 // delay: the server sets `updates_blocked_until` from it, which
                 // is what makes a deferral visible instead of looking like a
                 // device gone quiet.
-                transport
-                    .send(&link.rescheduled(delay_minutes, &reason))
-                    .await?;
+                let message = link.rescheduled(delay_minutes, &reason);
+                transport.send(&message).await?;
 
-                log::info!("update rescheduled for {delay_minutes} min: {reason}");
+                // What was sent, which is not what was asked for when the
+                // controller asked for less than the minimum.
+                log::info!(
+                    "update rescheduled for {} min: {reason}",
+                    message.payload["delay_for"]
+                );
                 return Ok(());
             }
 

@@ -172,7 +172,7 @@ pub enum UpdateDecision {
         reason: String,
     },
     /// Hold the update off for `delay_minutes` whole minutes, the unit
-    /// NervesHub reads. 0 is sent as 1.
+    /// NervesHub reads. Anything under 5 is sent as 5.
     Reschedule {
         delay_minutes: u64,
         reason: String,

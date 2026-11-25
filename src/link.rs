@@ -14,6 +14,11 @@ use crate::extensions::{Extensions, Incoming, EXTENSIONS_TOPIC};
 use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::{Stage, UpdatePayload};
 
+/// The shortest reschedule sent to NervesHub, in minutes. A shorter delay is
+/// raised to this, as `nerves_hub_link` does, so a device that asks for 0 is
+/// not offered the same update again straight away.
+pub const MIN_RESCHEDULE_MINUTES: u64 = 5;
+
 /// Something the run loop has to act on, beyond replying on the channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -216,15 +221,14 @@ impl Link {
     /// is no matching clause, the call raises inside the device's channel
     /// process, and the deferral the device asked for never happens.
     ///
-    /// A delay of 0 is sent as 1. Zero minutes blocks nothing, so the device
-    /// could be offered the same update again straight away.
+    /// A delay under [`MIN_RESCHEDULE_MINUTES`] is sent as that minimum.
     pub fn rescheduled(&mut self, delay_minutes: u64, reason: &str) -> Message {
         self.device_message(
             event::STATUS_UPDATE,
             json!({
                 "status": "rescheduled",
                 "reason": reason,
-                "delay_for": delay_minutes.max(1),
+                "delay_for": delay_minutes.max(MIN_RESCHEDULE_MINUTES),
             }),
         )
     }
@@ -400,14 +404,19 @@ mod tests {
         assert_eq!(message.payload["reason"], json!("busy"));
     }
 
-    /// Zero minutes blocks nothing, so it is sent as the shortest delay that
-    /// does.
+    /// `nerves_hub_link` never asks for less than five minutes, and neither
+    /// does the agent.
     #[test]
-    fn a_reschedule_is_at_least_a_minute() {
+    fn a_reschedule_is_at_least_five_minutes() {
         let mut link = Link::new("2.2.0", "fwup", &ExtensionsConfig::default());
-        let message = link.rescheduled(0, "busy");
 
-        assert_eq!(message.payload["delay_for"], json!(1));
+        for asked in [0, 1, 4] {
+            let message = link.rescheduled(asked, "busy");
+            assert_eq!(message.payload["delay_for"], json!(5), "asked for {asked}");
+        }
+
+        let message = link.rescheduled(5, "busy");
+        assert_eq!(message.payload["delay_for"], json!(5));
     }
 
     #[allow(dead_code)]

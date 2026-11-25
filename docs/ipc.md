@@ -107,7 +107,8 @@ that looks broken: `ignore` puts the device in its deployment's penalty box, and
 not decoration — the server computes `updates_blocked_until` from it and refuses
 the message without it.
 
-`delay_minutes` is whole minutes, the unit NervesHub reads, and 0 is sent as 1.
+`delay_minutes` is whole minutes, the unit NervesHub reads. Anything under 5 is
+sent as 5, the same minimum `nerves_hub_link` uses.
 Earlier versions of the agent took `delay_ms` here instead. A `reschedule` that
 still carries `delay_ms` is not understood: the agent logs a warning and does
 what `updates.on_timeout` says, which by default is to apply.
