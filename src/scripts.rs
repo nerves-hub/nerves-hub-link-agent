@@ -122,13 +122,20 @@ async fn execute(
     shebang: bool,
     env: &[(String, String)],
 ) -> Outcome {
-    let mut command = if shebang {
-        tokio::process::Command::new(path)
+    // What gets exec'd, and so what a failure to start has to name. With a
+    // shebang that is the script itself: the configured interpreter is never
+    // involved, and blaming it would send someone off to fix the wrong thing.
+    let program = if shebang {
+        path
     } else {
-        let mut command = tokio::process::Command::new(&config.interpreter);
-        command.arg(path);
-        command
+        std::path::Path::new(&config.interpreter)
     };
+
+    let mut command = tokio::process::Command::new(program);
+
+    if !shebang {
+        command.arg(path);
+    }
 
     command
         .stdin(Stdio::null())
@@ -149,12 +156,12 @@ async fn execute(
     #[cfg(unix)]
     command.process_group(0);
 
-    let child = match command.spawn() {
+    let child = match retry_while_busy(|| command.spawn()).await {
         Ok(child) => child,
         Err(e) => {
             return Outcome::failed(
                 reference.to_string(),
-                format!("could not run {}: {e}", config.interpreter),
+                format!("could not run {}: {e}", program.display()),
             )
         }
     };
@@ -207,6 +214,45 @@ async fn execute(
             ),
         ),
     }
+}
+
+/// How many times to try starting a script whose file is busy.
+const SPAWN_ATTEMPTS: u32 = 5;
+
+/// The wait before the second try, doubling after each one: 150ms in all.
+const FIRST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Start a process, waiting out a file that is briefly busy.
+///
+/// Linux will not exec a file that anything has open for writing, and fails
+/// with ETXTBSY, "Text file busy". The agent closes a script before running
+/// it, but that is not enough on its own. If another thread starts a process
+/// while the script is still open for writing (a second script, the update
+/// tool, anything that spawns), the new child gets a copy of the descriptor
+/// and keeps it until it execs. Close-on-exec closes it then, not before, and
+/// until then the script cannot be run, through no fault of its own.
+///
+/// That window is short, so a few quick retries see it through. Only a script
+/// run through its shebang is exec'd itself and can hit this; an interpreter
+/// only reads the script, so it never fails this way. Any other error fails at
+/// once, and so does a file still busy after the last try, because by then
+/// something really does have it open.
+async fn retry_while_busy<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut delay = FIRST_RETRY_DELAY;
+
+    for _ in 1..SPAWN_ATTEMPTS {
+        match attempt() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+
+    attempt()
 }
 
 fn has_shebang(text: &str) -> bool {
@@ -348,8 +394,163 @@ mod tests {
         // Runs anyway, because the shebang means the file is executed directly.
         let outcome = run(&config, "r1".into(), "#!/bin/sh\necho via-shebang", &[]).await;
 
-        assert_eq!(outcome.result, "ok");
+        assert_eq!(outcome.result, "ok", "{}", outcome.output);
         assert_eq!(outcome.output.trim(), "via-shebang");
+    }
+
+    #[tokio::test]
+    async fn a_missing_interpreter_is_named() {
+        let mut config = config();
+        config.interpreter = "definitely-not-a-real-interpreter".into();
+
+        let outcome = run(&config, "r1".into(), "echo hello", &[]).await;
+
+        assert_eq!(outcome.result, "error");
+        assert!(
+            outcome
+                .output
+                .starts_with("could not run definitely-not-a-real-interpreter: "),
+            "{}",
+            outcome.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shebang_script_that_cannot_start_names_the_script() {
+        // The script is what was exec'd, so the script is what failed. Naming
+        // the configured interpreter here would point at something that was
+        // never run.
+        let directory = tempfile::tempdir().unwrap();
+
+        let mut config = config();
+        config.work_dir = directory.path().to_path_buf();
+        config.interpreter = "the-configured-interpreter".into();
+
+        let outcome = run(
+            &config,
+            "r1".into(),
+            "#!/definitely/not/a/real/interpreter\necho hello",
+            &[],
+        )
+        .await;
+
+        let named = format!("could not run {}", directory.path().display());
+
+        assert_eq!(outcome.result, "error");
+        assert!(outcome.output.starts_with(&named), "{}", outcome.output);
+        assert!(outcome.output.contains("/script: "), "{}", outcome.output);
+        assert!(
+            !outcome.output.contains("the-configured-interpreter"),
+            "{}",
+            outcome.output
+        );
+    }
+
+    fn busy() -> std::io::Error {
+        std::io::ErrorKind::ExecutableFileBusy.into()
+    }
+
+    #[tokio::test]
+    async fn a_busy_file_is_tried_again() {
+        let mut attempts = 0;
+
+        let result = retry_while_busy(|| {
+            attempts += 1;
+
+            if attempts < 3 {
+                Err(busy())
+            } else {
+                Ok("started")
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "started");
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn any_other_error_is_not_tried_again() {
+        let mut attempts = 0;
+
+        let result: std::io::Result<()> = retry_while_busy(|| {
+            attempts += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_stays_busy_is_given_up_on() {
+        let mut attempts = 0;
+
+        let result: std::io::Result<()> = retry_while_busy(|| {
+            attempts += 1;
+            Err(busy())
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        assert_eq!(attempts, SPAWN_ATTEMPTS);
+    }
+
+    /// The kernel's side of the retry, which the tests above can only assume:
+    /// exec of a file open for writing really does fail, and with the error
+    /// kind `retry_while_busy` looks for.
+    ///
+    /// The descriptor held here stands in for one some other thread's child
+    /// inherited. It is closed after the first attempt, so that attempt is
+    /// certain to fail and a later one to succeed, with no race to win.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_script_open_for_writing_runs_once_it_is_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("script");
+
+        std::fs::write(&path, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut writer = Some(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+
+        let mut command = tokio::process::Command::new(&path);
+        command.stdout(Stdio::piped());
+
+        let mut failures = Vec::new();
+
+        let child = retry_while_busy(|| {
+            let spawned = command.spawn();
+
+            if let Err(e) = &spawned {
+                failures.push(e.kind());
+            }
+
+            writer = None;
+            spawned
+        })
+        .await
+        .unwrap();
+
+        // More than one failure is possible, if another test's child briefly
+        // inherited the descriptor too. Every one of them must be "busy".
+        assert!(!failures.is_empty(), "the first exec should have failed");
+        assert!(
+            failures
+                .iter()
+                .all(|kind| *kind == std::io::ErrorKind::ExecutableFileBusy),
+            "{failures:?}"
+        );
+
+        let output = child.wait_with_output().await.unwrap();
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ran");
     }
 
     #[tokio::test]
