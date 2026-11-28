@@ -277,6 +277,13 @@ stdout and so does the reason it gave up, so a parser that keeps only the
 integers throws away the one sentence explaining a failed update. The agent
 keeps both.
 
+**A stalled download reads to fwup as a truncated archive.** When the server
+goes quiet for `http.stall_timeout_secs`, the agent stops feeding fwup, and fwup
+fails with something like `ZIP decompression failed (-5)`. That is true and
+beside the point, so the agent reports the stall instead
+([When a download stalls](connecting.md#when-a-download-stalls)). The slot
+fwup was writing is the one not running, so the device is left as it was.
+
 **`u-boot-tools` has no `fw_printenv` on Debian 12.** It is in
 `libubootenv-tool`.
 

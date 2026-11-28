@@ -19,10 +19,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nerves_hub_link_agent::config::{FwupConfig, FwupMetadataSource};
+use nerves_hub_link_agent::http::{Client, Timeouts};
 use nerves_hub_link_agent::update_tool::fwup::Fwup;
-use nerves_hub_link_agent::{FirmwareMeta, Stage, UpdatePayload};
+use nerves_hub_link_agent::{Error, FirmwareMeta, Stage, UpdatePayload};
 
 const ROOTFS_A_LBA: u32 = 2048;
 const ROOTFS_B_LBA: u32 = 4096;
@@ -158,6 +160,47 @@ async fn a_truncated_archive_fails_without_disturbing_the_running_slot() {
     assert_eq!(slot_contents(&disk, ROOTFS_A_LBA), "rootfs version 1");
 
     println!("truncated archive reported: {error}");
+}
+
+/// A download that goes quiet part-way ends the install, and the error is the
+/// stall rather than the truncated archive fwup was left holding: fwup's
+/// complaint is true, and names the wrong problem.
+#[tokio::test]
+#[ignore = "needs fwup; run in the container"]
+async fn a_stalled_download_fails_as_a_stall() {
+    let work = scratch("stalled");
+
+    let v1 = build_archive(&work, "1", "0.1.0");
+    let v2 = build_archive(&work, "2", "0.2.0");
+
+    let disk = work.join("disk.img");
+    factory_write(&disk, &v1);
+
+    let whole = std::fs::read(&v2).unwrap();
+    let (url, _server) = serve_then_stall(&whole, whole.len() / 2).await;
+    let mut fwup = tool(&disk);
+
+    let client = Client::with_native_roots_and_timeouts(Timeouts {
+        connect: Duration::from_secs(5),
+        stall: Duration::from_secs(1),
+    })
+    .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(30),
+        fwup.install_async(&update(&url, &whole), &client, |_, _| {}),
+    )
+    .await
+    .expect("the install never ended: the stall timeout did not fire")
+    .expect_err("half an archive installed successfully");
+
+    assert!(
+        matches!(&error, Error::Download(m) if m.starts_with("stalled after")),
+        "got: {error}"
+    );
+
+    assert_eq!(live_slot(&disk), ROOTFS_A_LBA);
+    assert_eq!(slot_contents(&disk, ROOTFS_A_LBA), "rootfs version 1");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +349,36 @@ async fn serve(file: &Path) -> (String, tokio::task::JoinHandle<()>) {
                 let _ = socket.write_all(header.as_bytes()).await;
                 let _ = socket.write_all(&body).await;
                 let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    (url, handle)
+}
+
+/// Headers for the whole of `body`, the first `sent` bytes of it, then silence
+/// on a connection that stays open, as a dead one does.
+async fn serve_then_stall(body: &[u8], sent: usize) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let length = body.len();
+    let prefix = body[..sent].to_vec();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/firmware.fw", listener.local_addr().unwrap());
+
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let prefix = prefix.clone();
+
+            tokio::spawn(async move {
+                let mut scratch = [0u8; 2048];
+                let _ = socket.read(&mut scratch).await;
+
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&prefix).await;
+
+                while socket.read(&mut scratch).await.is_ok_and(|n| n > 0) {}
             });
         }
     });
