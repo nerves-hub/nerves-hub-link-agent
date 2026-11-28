@@ -167,3 +167,43 @@ correct for the server and useless for the device.
 The agent verifies the SHA-256 of what it downloaded before handing it to the
 update tool. For fwup, also set `public_key` — NervesHub checked the archive's
 signature at upload, which says nothing about the bytes that arrived here.
+
+### When a download stalls
+
+The download is its own HTTP connection, separate from the socket, and it has
+two timeouts:
+
+```toml
+[http]
+connect_timeout_secs = 30
+stall_timeout_secs = 60
+```
+
+`stall_timeout_secs` is how long the server may send nothing at all: no
+response to the request, or no more of the body. It is not a limit on the
+whole download. A large image over a slow link takes as long as it takes, and
+only silence counts against it. The case it exists for is a connection that
+dies without a reset (a NAT that forgot it, a cellular link that dropped, a
+proxy that wedged), where nothing arrives and nothing errors. Without a limit,
+the install waits on it forever, and since the agent installs one update at a
+time, it refuses every update after that one until it restarts.
+
+When the limit runs out, the install fails and the agent reports `failed` to
+NervesHub, with a reason that says how far it got:
+
+```
+download: stalled after 41943040 bytes: nothing from storage.example.com in 60s
+```
+
+or `download: stalled: no response from storage.example.com in 60s` if the
+server never answered the request. The host is where the download was actually
+coming from, after any redirect, so it is often object storage rather than
+NervesHub. The agent then takes the next update NervesHub sends. The download
+does not resume: the next attempt starts from the beginning.
+
+`connect_timeout_secs` is how long the TCP connection may take to open. When a
+name resolves to several addresses, they share it. Both defaults match
+`nerves_hub_link`'s.
+
+These cover fwup and the sandbox, which download through the agent, and the geo
+lookup. RAUC does its own transfer, so they do not reach it.

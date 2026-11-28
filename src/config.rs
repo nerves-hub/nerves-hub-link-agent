@@ -27,6 +27,43 @@ pub struct Config {
     pub extensions: Extensions,
     #[serde(default)]
     pub scripts: ScriptsConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
+}
+
+/// The agent's own HTTP client: the firmware download for fwup and the
+/// sandbox, and the geo lookup.
+///
+/// RAUC does its own transfer, so none of this reaches it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpConfig {
+    /// Give up on a TCP connection that has not opened in this long.
+    ///
+    /// Shared between the addresses when a name resolves to more than one.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Give up on a server that has sent nothing for this long: no response
+    /// to the request, or no more of the body.
+    ///
+    /// Not a limit on the whole download. A large image over a slow link takes
+    /// as long as it takes, and only silence counts against it. Without this,
+    /// a download on a connection that died without a reset waits forever, and
+    /// the install it belongs to holds the device: every update offered after
+    /// it is refused as "already installing" until the agent restarts.
+    ///
+    /// The clock runs only while the agent waits on the network, so a slow
+    /// disk behind fwup does not count against it.
+    #[serde(default = "default_stall_timeout")]
+    pub stall_timeout_secs: u64,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: default_connect_timeout(),
+            stall_timeout_secs: default_stall_timeout(),
+        }
+    }
 }
 
 /// Support scripts, run as shell scripts.
@@ -721,6 +758,14 @@ fn default_shell() -> String {
 fn default_shell_chunk() -> usize {
     4096
 }
+/// Mint's default, which is what `nerves_hub_link` downloads with.
+fn default_connect_timeout() -> u64 {
+    30
+}
+/// `nerves_hub_link`'s `idle_timeout`, and the ESP32 agent's HTTP timeout.
+fn default_stall_timeout() -> u64 {
+    60
+}
 
 impl Identity {
     /// Where this identity's device identifier comes from.
@@ -784,6 +829,14 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+
+        // Zero would fail every download the moment it started, which looks
+        // from the server like a network problem rather than a typo.
+        if self.http.connect_timeout_secs == 0 || self.http.stall_timeout_secs == 0 {
+            return Err(crate::Error::Config(
+                "http.connect_timeout_secs and http.stall_timeout_secs must be at least 1".into(),
+            ));
         }
 
         Ok(())
@@ -881,6 +934,41 @@ mod tests {
         assert!(
             error.to_string().contains("confirm_command"),
             "the error should name the missing setting, got: {error}"
+        );
+    }
+
+    const MINIMAL: &str = r#"
+        [server]
+        host = "example.test"
+
+        [identity]
+        product_key = "k"
+        product_secret = "s"
+        identifier = { literal = "d" }
+
+        [update_tool]
+        name = "sandbox"
+    "#;
+
+    /// A config with no `[http]` still gets timeouts. Without them a download
+    /// on a dead connection never ends.
+    #[test]
+    fn http_timeouts_default_when_unset() {
+        let config = Config::from_toml(MINIMAL).expect("should parse");
+
+        assert_eq!(config.http.connect_timeout_secs, 30);
+        assert_eq!(config.http.stall_timeout_secs, 60);
+    }
+
+    #[test]
+    fn a_zero_stall_timeout_is_refused_at_load() {
+        let source = format!("{MINIMAL}\n[http]\nstall_timeout_secs = 0\n");
+
+        let error = Config::from_toml(&source).expect_err("should be refused");
+
+        assert!(
+            error.to_string().contains("stall_timeout_secs"),
+            "the error should name the setting, got: {error}"
         );
     }
 

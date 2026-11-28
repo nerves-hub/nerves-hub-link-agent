@@ -177,7 +177,10 @@ sequence its own shutdown.
 **Timeouts.** Every question the agent asks your application has a deadline and
 a configured answer for each way it can go unanswered. An agent that blocks
 forever on an application that died is a device that has quietly left the fleet
-while still looking healthy from the server.
+while still looking healthy from the server. The firmware download is held to
+the same rule: a server that sends nothing for `http.stall_timeout_secs` fails
+the install rather than holding the device
+([Firmware downloads](docs/connecting.md#when-a-download-stalls)).
 
 ## Talking to the agent
 

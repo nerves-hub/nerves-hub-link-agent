@@ -98,6 +98,21 @@ metadata = { file = "/etc/nerves-hub/firmware.env" }
 
 
 # ---------------------------------------------------------------------------
+# The agent's HTTP client: the firmware download for fwup, and the geo lookup.
+# RAUC does its own transfer, so none of this reaches it.
+# ---------------------------------------------------------------------------
+
+[http]
+connect_timeout_secs = 30
+# How long the server may send nothing: no response, or no more of the body.
+# Not a limit on the whole download, which on a slow link takes as long as it
+# takes. A download on a connection that died without a reset would otherwise
+# never end, and the device would refuse every update after it until the agent
+# restarted. A stalled download is reported to NervesHub as a failed update.
+stall_timeout_secs = 60
+
+
+# ---------------------------------------------------------------------------
 # The socket applications connect to. See docs/ipc.md.
 # ---------------------------------------------------------------------------
 

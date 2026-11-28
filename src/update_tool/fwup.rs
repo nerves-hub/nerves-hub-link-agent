@@ -35,6 +35,11 @@ use crate::error::Error;
 use crate::update_tool::{BootState, Installed, UpdateTool};
 use crate::{FirmwareMeta, Stage, UpdatePayload};
 
+/// How long a failed fwup waits for the transfer feeding it to say whether it
+/// failed first. One that did has already finished, and one that did not ends
+/// at its next write, so this only matters when the server has gone quiet.
+const TRANSFER_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct Fwup {
     config: FwupConfig,
     /// Reported at join as `fwup_version`. NervesHub uses it to decide whether
@@ -196,7 +201,7 @@ impl Fwup {
         // Feeding fwup and reading its progress have to happen at once: fwup
         // consumes stdin as it writes, so waiting for the transfer to finish
         // before reading stdout deadlocks as soon as the pipe buffer fills.
-        let feeder = tokio::spawn(feed(response, stdin));
+        let mut feeder = tokio::spawn(feed(response, stdin));
         let collector = tokio::spawn(collect(stderr));
 
         let mut lines = BufReader::new(stdout).lines();
@@ -226,15 +231,24 @@ impl Fwup {
         }
 
         let status = child.wait().await?;
-
-        let transferred = feeder.await.map_err(|e| Error::UpdateTool {
-            tool: "fwup",
-            message: format!("the transfer task failed: {e}"),
-        })?;
-
         let complaints = collector.await.unwrap_or_default();
 
         if !status.success() {
+            // A transfer that failed is why fwup failed, not the other way
+            // round. fwup was left with a truncated archive and says so, which
+            // is true and names the wrong problem. The stall is the sentence
+            // someone can act on.
+            //
+            // Otherwise fwup gave up for its own reasons, and the transfer
+            // ends the next time it writes. One waiting on a server that has
+            // gone quiet would hold this for the whole stall timeout, for an
+            // answer nobody needs.
+            match tokio::time::timeout(TRANSFER_GRACE, &mut feeder).await {
+                Ok(Ok(Err(e @ Error::Download(_)))) => return Err(e),
+                Ok(_) => {}
+                Err(_) => feeder.abort(),
+            }
+
             // fwup's own words, from wherever it chose to put them. A failed
             // update is nearly always diagnosed from what fwup said, not from
             // where the agent noticed it stopped.
@@ -258,11 +272,14 @@ impl Fwup {
             });
         }
 
+        let transferred = feeder.await.map_err(|e| Error::UpdateTool {
+            tool: "fwup",
+            message: format!("the transfer task failed: {e}"),
+        })??;
+
         // Checked after the fact on purpose. fwup has already refused a corrupt
         // archive by here, so reaching this and failing means something subtler:
         // the bytes were right for fwup and wrong for what NervesHub recorded.
-        let transferred = transferred?;
-
         if let Some(expected) = update.checksum.as_deref() {
             if !expected.eq_ignore_ascii_case(&transferred.digest) {
                 return Err(Error::Download(format!(
