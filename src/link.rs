@@ -144,7 +144,19 @@ impl Link {
     /// metadata through a per-tool callback: fwup devices send `nerves_fw_*`,
     /// ESP-IDF devices `esp_idf_*`, RAUC devices `rauc_*`. Naming them here
     /// would have every tool claim to be fwup.
-    pub fn join(&mut self, params: &[(&str, Value)]) -> Message {
+    ///
+    /// `currently_downloading` is the UUID of the firmware an install is
+    /// writing, or `None` when nothing is installing, in which case the key is
+    /// left out. NervesHub reads a join without it as a device that is not
+    /// updating and abandons whatever update it had open for it: the update is
+    /// recorded as abandoned and counted against the device as a failure, and
+    /// the progress the install goes on to report belongs to no update. A
+    /// device that reconnects mid-install has to say what it is installing.
+    pub fn join(
+        &mut self,
+        params: &[(&str, Value)],
+        currently_downloading: Option<&str>,
+    ) -> Message {
         let reference = self.refs.next_ref();
         self.join_ref = Some(reference.clone());
 
@@ -159,6 +171,10 @@ impl Link {
         if let Some(object) = payload.as_object_mut() {
             for (key, value) in params {
                 object.insert((*key).to_string(), value.clone());
+            }
+
+            if let Some(uuid) = currently_downloading {
+                object.insert("currently_downloading_uuid".to_string(), json!(uuid));
             }
         }
 
@@ -433,17 +449,45 @@ mod tests {
     #[test]
     fn the_join_topic_is_unqualified() {
         let mut link = Link::new("2.2.0", "fwup", &Default::default());
-        let join = link.join(&fwup_params());
+        let join = link.join(&fwup_params(), None);
 
         assert_eq!(join.topic, "device");
         assert_eq!(join.payload["update_tool"], "fwup");
         assert_eq!(join.payload["nerves_fw_uuid"], "abc-123");
     }
 
+    /// NervesHub keeps the inflight update of a device that joins saying what
+    /// it is downloading, and abandons it otherwise.
+    #[test]
+    fn a_join_mid_install_names_the_firmware_being_installed() {
+        let mut link = Link::new("2.2.0", "fwup", &Default::default());
+        let join = link.join(&fwup_params(), Some("def-456"));
+
+        assert_eq!(join.payload["currently_downloading_uuid"], "def-456");
+
+        // The running firmware is still the running firmware: the new one is
+        // going into the other slot.
+        assert_eq!(join.payload["nerves_fw_uuid"], "abc-123");
+    }
+
+    /// Left out rather than sent as `null`, as the ESP32 agent does. NervesHub
+    /// treats the two the same.
+    #[test]
+    fn an_idle_join_leaves_currently_downloading_uuid_out() {
+        let mut link = Link::new("2.2.0", "fwup", &Default::default());
+        let join = link.join(&fwup_params(), None);
+
+        assert!(
+            join.payload.get("currently_downloading_uuid").is_none(),
+            "an idle join sent {}",
+            join.payload
+        );
+    }
+
     #[test]
     fn a_join_reply_carrying_an_update_is_acted_on() {
         let mut link = Link::new("2.2.0", "fwup", &Default::default());
-        let join = link.join(&fwup_params());
+        let join = link.join(&fwup_params(), None);
 
         let reply = Message {
             join_ref: join.join_ref.clone(),
@@ -492,7 +536,7 @@ mod tests {
     #[test]
     fn a_closed_channel_asks_for_a_reconnect() {
         let mut link = Link::new("2.2.0", "fwup", &Default::default());
-        let _ = link.join(&fwup_params());
+        let _ = link.join(&fwup_params(), None);
 
         let close = Message {
             join_ref: None,

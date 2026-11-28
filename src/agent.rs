@@ -227,6 +227,8 @@ struct ShellSession {
 /// An install running as a task, and the two things the session loop needs
 /// from it: progress as it happens, and the tool back when it is done.
 struct InstallSession {
+    /// The firmware being installed, from the update that started it. Its UUID
+    /// goes on every join until the install ends.
     firmware: FirmwareMeta,
     progress: mpsc::UnboundedReceiver<(Stage, u8)>,
     #[allow(clippy::type_complexity)]
@@ -375,7 +377,22 @@ impl Agent {
             .update_shared(|shared| shared.firmware = Some(firmware.clone()))
             .await;
 
-        transport.send(&link.join(&join_params)).await?;
+        // What an install is writing, read at every join rather than kept from
+        // the first: a session that starts mid-install has to say so, and one
+        // that starts after it ended must not.
+        //
+        // An install whose task finished during the backoff still counts. Its
+        // outcome is reported from the loop below, after this join, and a join
+        // that said nothing was installing would have NervesHub abandon the
+        // update just before being told how it went.
+        let currently_downloading = self
+            .install
+            .as_ref()
+            .and_then(|install| install.firmware.uuid.clone());
+
+        transport
+            .send(&link.join(&join_params, currently_downloading.as_deref()))
+            .await?;
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
             self.config.server.heartbeat_interval_secs,

@@ -12,6 +12,11 @@
 //! *while the install is still running*, and then reports the result on the
 //! new socket.
 //!
+//! That rejoin also has to say what it is installing. NervesHub abandons the
+//! open update of a device that joins without `currently_downloading_uuid`, so
+//! a reconnect that stayed quiet would lose the server's record of an install
+//! that is going fine. A join once the install is over has to say nothing.
+//!
 //! The sandbox tool is what makes this runnable anywhere: it downloads,
 //! verifies and writes to a file, takes `install_duration_secs` to do it -- the
 //! window this test needs -- and its "reboot" is a log line.
@@ -40,16 +45,33 @@ const INSTALL_SECS: u64 = 5;
 /// is wedged, and a hang is a worse failure report than an assertion.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// The firmware the fake server offers.
+const TARGET_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
 /// What the fake server saw, tagged with which connection saw it. The
 /// connection number is the whole point: the same events on connection 1 and
 /// connection 2 mean opposite things.
 #[derive(Debug, Clone, PartialEq)]
 enum Seen {
-    Joined(usize),
+    /// A join, and its `currently_downloading_uuid` exactly as sent: `None`
+    /// when the key was left out, which is not the same as a `null`.
+    Joined(usize, Option<serde_json::Value>),
     Progress(usize),
     Dropped(usize),
     Rebooting(usize),
     Status(usize, String),
+}
+
+/// When the fake server hangs up on the device's first connection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HangUp {
+    /// It doesn't.
+    Never,
+    /// At the first progress report, so the install is provably running.
+    MidInstall,
+    /// Once the device reports how the install ended, so the rejoin comes with
+    /// nothing installing.
+    AfterInstall,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -59,9 +81,9 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
 
     let (firmware_url, _http) = serve_file(&firmware).await;
     let (events, mut seen) = mpsc::unbounded_channel();
-    let ws_port = fake_nerveshub(firmware_url, events, true).await;
+    let ws_port = fake_nerveshub(firmware_url, events, HangUp::MidInstall).await;
 
-    let config = config(&work, ws_port);
+    let config = config(&work, ws_port, false);
     let tool = Tool::build(&config.update_tool).expect("sandbox tool");
     let mut agent = Agent::new(config, "agent-test-01".into(), tool)
         .await
@@ -80,7 +102,7 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
     tokio::select! {
         outcome = agent.run() => panic!("the agent gave up instead of reconnecting: {outcome:?}"),
 
-        collected = tokio::time::timeout(PATIENCE, collect_until_reboot(&mut seen, &mut log)) => {
+        collected = tokio::time::timeout(PATIENCE, collect_until(&mut seen, &mut log, reported_rebooting)) => {
             if collected.is_err() {
                 panic!("no reboot report within {PATIENCE:?}; got as far as {log:?}");
             }
@@ -88,9 +110,10 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
     }
 
     // The setup: joined, offered an update, started installing, lost the socket.
+    // Nothing was installing at the first join, so it said nothing.
     assert!(
-        log.contains(&Seen::Joined(1)),
-        "never joined on the first connection: {log:?}"
+        log.contains(&Seen::Joined(1, None)),
+        "never joined idle on the first connection: {log:?}"
     );
     assert!(
         log.contains(&Seen::Progress(1)),
@@ -105,8 +128,13 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
     // handshake -- and it happened before the install finished, which is what
     // "an install does not block the agent" actually means. An agent that only
     // rejoined once the tool was free would still pass a bare `contains`.
-    let rejoined = position(&log, &Seen::Joined(2))
-        .unwrap_or_else(|| panic!("never rejoined after the socket dropped: {log:?}"));
+    //
+    // And it names the firmware it is installing, or NervesHub would abandon
+    // the update it has open for this one.
+    let rejoined =
+        position(&log, &Seen::Joined(2, Some(json!(TARGET_UUID)))).unwrap_or_else(|| {
+            panic!("never rejoined saying what it was installing after the socket dropped: {log:?}")
+        });
 
     let finished = position(&log, &Seen::Rebooting(2))
         .unwrap_or_else(|| panic!("the install never reported finishing: {log:?}"));
@@ -117,9 +145,7 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
     );
 
     // And the install the socket interrupted ran to completion regardless.
-    let installed = work
-        .join("sandbox")
-        .join("22222222-2222-2222-2222-222222222222.fw");
+    let installed = work.join("sandbox").join(format!("{TARGET_UUID}.fw"));
 
     assert!(
         installed.exists(),
@@ -128,16 +154,113 @@ async fn the_agent_reconnects_while_an_install_is_still_running() {
     );
 }
 
-/// Drain events until the install reports it is done, keeping them in order.
-async fn collect_until_reboot(seen: &mut UnboundedReceiver<Seen>, log: &mut Vec<Seen>) {
+/// Once an install has reported how it went, there is nothing left for
+/// NervesHub to keep open, and a rejoin that still named the firmware would
+/// keep the server's record of an update that is over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_after_a_finished_install_names_nothing() {
+    let work = scratch("rejoin-after-install");
+    let firmware = write_firmware(&work);
+
+    let (firmware_url, _http) = serve_file(&firmware).await;
+    let (events, mut seen) = mpsc::unbounded_channel();
+    let ws_port = fake_nerveshub(firmware_url, events, HangUp::AfterInstall).await;
+
+    let config = config(&work, ws_port, false);
+    let tool = Tool::build(&config.update_tool).expect("sandbox tool");
+    let mut agent = Agent::new(config, "agent-test-03".into(), tool)
+        .await
+        .expect("agent");
+
+    let log = rejoin_after_install(&mut agent, &mut seen).await;
+
+    let completed = position(&log, &Seen::Status(1, "completed".into()))
+        .unwrap_or_else(|| panic!("never reported the install completing: {log:?}"));
+
+    let rejoined = position(&log, &Seen::Joined(2, None))
+        .unwrap_or_else(|| panic!("the rejoin still named the installed firmware: {log:?}"));
+
+    assert!(
+        completed < rejoined,
+        "rejoined before the install finished, so this proves nothing: {log:?}"
+    );
+}
+
+/// The same after an install that failed, which ends it as surely as success.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_after_a_failed_install_names_nothing() {
+    let work = scratch("rejoin-after-failure");
+    let firmware = write_firmware(&work);
+
+    let (firmware_url, _http) = serve_file(&firmware).await;
+    let (events, mut seen) = mpsc::unbounded_channel();
+    let ws_port = fake_nerveshub(firmware_url, events, HangUp::AfterInstall).await;
+
+    let config = config(&work, ws_port, true);
+    let tool = Tool::build(&config.update_tool).expect("sandbox tool");
+    let mut agent = Agent::new(config, "agent-test-04".into(), tool)
+        .await
+        .expect("agent");
+
+    let log = rejoin_after_install(&mut agent, &mut seen).await;
+
+    let failed = position(&log, &Seen::Status(1, "failed".into()))
+        .unwrap_or_else(|| panic!("never reported the install failing: {log:?}"));
+
+    let rejoined = position(&log, &Seen::Joined(2, None))
+        .unwrap_or_else(|| panic!("the rejoin still named the failed firmware: {log:?}"));
+
+    assert!(
+        failed < rejoined,
+        "rejoined before the install failed, so this proves nothing: {log:?}"
+    );
+}
+
+/// Run the agent against a server that hangs up once the install has ended,
+/// until the device joins a second time.
+async fn rejoin_after_install(agent: &mut Agent, seen: &mut UnboundedReceiver<Seen>) -> Vec<Seen> {
+    let mut log = Vec::new();
+
+    tokio::select! {
+        outcome = agent.run() => panic!("the agent stopped: {outcome:?}"),
+
+        collected = tokio::time::timeout(PATIENCE, collect_until(seen, &mut log, joined_again)) => {
+            if collected.is_err() {
+                panic!("no second join within {PATIENCE:?}; got as far as {log:?}");
+            }
+        }
+    }
+
+    assert!(
+        log.contains(&Seen::Joined(1, None)),
+        "never joined idle on the first connection: {log:?}"
+    );
+
+    log
+}
+
+/// Drain events until `done` says so, keeping them in order.
+async fn collect_until(
+    seen: &mut UnboundedReceiver<Seen>,
+    log: &mut Vec<Seen>,
+    done: fn(&Seen) -> bool,
+) {
     while let Some(event) = seen.recv().await {
-        let done = matches!(event, Seen::Rebooting(_));
+        let finished = done(&event);
         log.push(event);
 
-        if done {
+        if finished {
             return;
         }
     }
+}
+
+fn reported_rebooting(event: &Seen) -> bool {
+    matches!(event, Seen::Rebooting(_))
+}
+
+fn joined_again(event: &Seen) -> bool {
+    matches!(event, Seen::Joined(2, _))
 }
 
 fn position(log: &[Seen], event: &Seen) -> Option<usize> {
@@ -147,13 +270,13 @@ fn position(log: &[Seen], event: &Seen) -> Option<usize> {
 /// A NervesHub that offers one update and then hangs up on the device
 /// mid-install.
 ///
-/// Connection 1 offers the update and drops as soon as the device reports
-/// progress. Every connection after that behaves: it accepts the join and says
-/// there is nothing to do, which is what a reconnecting device should find.
+/// Connection 1 offers the update and drops when `hang_up` says to. Every
+/// connection after that behaves: it accepts the join and says there is nothing
+/// to do, which is what a reconnecting device should find.
 async fn fake_nerveshub(
     firmware_url: String,
     events: UnboundedSender<Seen>,
-    hang_up_on_progress: bool,
+    hang_up: HangUp,
 ) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -166,7 +289,6 @@ async fn fake_nerveshub(
 
             let events = events.clone();
             let firmware_url = firmware_url.clone();
-            let hang_up_on_progress = hang_up_on_progress;
 
             tokio::spawn(async move {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -183,10 +305,21 @@ async fn fake_nerveshub(
                     };
 
                     match message.event.as_str() {
+                        // The extensions join. Accepted, and neither recorded
+                        // nor answered with an update: `Seen::Joined` is the
+                        // device join, whose payload these tests read.
+                        event::JOIN if message.topic != DEVICE_TOPIC => {
+                            let reply = reply_ok(&message);
+                            let _ = socket.send(WsMessage::Text(reply)).await;
+                        }
+
                         event::JOIN => {
                             let reply = reply_ok(&message);
                             let _ = socket.send(WsMessage::Text(reply)).await;
-                            let _ = events.send(Seen::Joined(connection));
+
+                            let downloading =
+                                message.payload.get("currently_downloading_uuid").cloned();
+                            let _ = events.send(Seen::Joined(connection, downloading));
 
                             if connection == 1 {
                                 let update = Message::new(
@@ -207,7 +340,7 @@ async fn fake_nerveshub(
                             // progress rather than sleeping means the install is
                             // provably underway when the socket goes, on a slow
                             // machine as well as a fast one.
-                            if hang_up_on_progress && connection == 1 {
+                            if hang_up == HangUp::MidInstall && connection == 1 {
                                 let _ = events.send(Seen::Dropped(connection));
                                 return;
                             }
@@ -221,7 +354,13 @@ async fn fake_nerveshub(
                                 .unwrap_or("")
                                 .to_string();
 
+                            let ended = matches!(status.as_str(), "completed" | "failed");
                             let _ = events.send(Seen::Status(connection, status));
+
+                            if hang_up == HangUp::AfterInstall && connection == 1 && ended {
+                                let _ = events.send(Seen::Dropped(connection));
+                                return;
+                            }
                         }
 
                         event::REBOOTING => {
@@ -255,7 +394,7 @@ fn update_payload(firmware_url: &str) -> serde_json::Value {
         "update_available": true,
         "firmware_url": firmware_url,
         "firmware_meta": {
-            "uuid": "22222222-2222-2222-2222-222222222222",
+            "uuid": TARGET_UUID,
             "version": "1.0.1",
             "product": "test-product",
             "platform": "sandbox",
@@ -264,7 +403,8 @@ fn update_payload(firmware_url: &str) -> serde_json::Value {
     })
 }
 
-fn config(work: &Path, ws_port: u16) -> Config {
+/// `fail_installs` has the sandbox fail every install before it downloads.
+fn config(work: &Path, ws_port: u16, fail_installs: bool) -> Config {
     let toml = format!(
         r#"
 [server]
@@ -287,6 +427,7 @@ name = "sandbox"
 work_dir = "{work_dir}"
 initial_firmware = {{ uuid = "11111111-1111-1111-1111-111111111111", version = "1.0.0", product = "test-product", platform = "sandbox", architecture = "x86_64" }}
 install_duration_secs = {INSTALL_SECS}
+fail_installs = {fail_installs}
 
 [ipc]
 socket = "{ipc}"
@@ -370,9 +511,9 @@ async fn a_successful_install_reports_started_and_completed() {
 
     let (firmware_url, _http) = serve_file(&firmware).await;
     let (events, mut seen) = mpsc::unbounded_channel();
-    let ws_port = fake_nerveshub(firmware_url, events, false).await;
+    let ws_port = fake_nerveshub(firmware_url, events, HangUp::Never).await;
 
-    let config = config(&work, ws_port);
+    let config = config(&work, ws_port, false);
     let tool = Tool::build(&config.update_tool).expect("sandbox tool");
     let mut agent = Agent::new(config, "agent-test-02".into(), tool)
         .await
@@ -383,7 +524,7 @@ async fn a_successful_install_reports_started_and_completed() {
     tokio::select! {
         outcome = agent.run() => panic!("the agent stopped: {outcome:?}"),
 
-        collected = tokio::time::timeout(PATIENCE, collect_until_reboot(&mut seen, &mut log)) => {
+        collected = tokio::time::timeout(PATIENCE, collect_until(&mut seen, &mut log, reported_rebooting)) => {
             if collected.is_err() {
                 panic!("no reboot report within {PATIENCE:?}; got as far as {log:?}");
             }
@@ -413,9 +554,7 @@ async fn a_successful_install_reports_started_and_completed() {
     );
 
     // And the install it was reporting on actually happened.
-    let installed = work
-        .join("sandbox")
-        .join("22222222-2222-2222-2222-222222222222.fw");
+    let installed = work.join("sandbox").join(format!("{TARGET_UUID}.fw"));
 
     assert!(
         installed.exists(),
