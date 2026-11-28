@@ -167,3 +167,21 @@ correct for the server and useless for the device.
 The agent verifies the SHA-256 of what it downloaded before handing it to the
 update tool. For fwup, also set `public_key` — NervesHub checked the archive's
 signature at upload, which says nothing about the bytes that arrived here.
+
+## Reconnecting during an update
+
+An install keeps going when the socket drops. The agent reconnects on its usual
+backoff while the install runs, and sends the progress and the result over
+whichever connection is up by then.
+
+While an install is running, every join of the `device` topic carries
+`currently_downloading_uuid`: the UUID of the firmware being installed, from
+the update's `firmware_meta`. NervesHub treats a join without it as a device
+that isn't updating, and abandons the update it had open: it records the update
+as abandoned, counts it as a failure against the device, and loses track of the
+install still running. Once the install succeeds or fails, joins leave the key
+out again. This matches what `nerves_hub_link` and the ESP32 agent send.
+
+The firmware download is its own HTTP connection, so a NervesHub restart
+doesn't interrupt it. A network outage can, and an interrupted download starts
+again from the beginning next time (see "Not implemented yet" in the README).

@@ -275,7 +275,7 @@ nowhere.
 
 | | |
 | --- | --- |
-| [connecting.md](docs/connecting.md) | Endpoints, shared secrets, TLS, and what each connection failure means |
+| [connecting.md](docs/connecting.md) | Endpoints, shared secrets, TLS, what each connection failure means, and reconnecting mid-update |
 | [fwup.md](docs/fwup.md) | The fwup update tool, what the image must provide, and a QEMU rig |
 | [rauc.md](docs/rauc.md) | The RAUC update tool, what the image must provide, and a QEMU rig |
 | [deploying.md](docs/deploying.md) | Onto real hardware: cross-compiling, systemd, Buildroot, Yocto |
